@@ -134,6 +134,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
           - name: Inductor Ops
             config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
+          - name: Inductor Matmul
+            config: torch_spyre_tests/inductor/test_matmul_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
