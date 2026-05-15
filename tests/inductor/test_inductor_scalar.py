@@ -83,7 +83,6 @@ class TestTensorScalarCoreArithmetic:
             run_eager=(execution_mode == "eager"),
         )
 
-
     def test_scalar_add_mul_sub_zero_one_and_ndim_tensors(self, execution_mode):
         """
         One scalar Python op per rank: 0-D ``+1``, 1-D ``*2.5``, 3-D ``-3``.
