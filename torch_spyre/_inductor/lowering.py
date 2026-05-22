@@ -20,7 +20,7 @@ import torch
 from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
-from .ir import SpyreConstantFallback
+from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from typing import Any, Callable, Union
 
@@ -706,9 +706,57 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
+def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if dtype not in (torch.float16, torch.float32):
+        return ir.TensorBox.create(
+            ir.FallbackKernel.create(
+                torch.ops.aten.full.default,
+                size,
+                fill_value,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                pin_memory=pin_memory,
+            )
+        )
+    scalar = ir.TensorBox.create(
+        SpyreConstantFallback(
+            torch.ops.spyre.constant.default, float(fill_value), dtype, device
+        )
+    )
+    scalar_loader = scalar.make_loader()
+
+    def inner_fn(index):
+        return scalar_loader([])
+
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=list(size),
+    )
+
+
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
 def lower_constant(value, dtype, device):
     op_overload = getattr(
         torch.ops.spyre.constant, V.graph.current_node.target._overloadname
     )
     return ir.TensorBox.create(SpyreConstantFallback(op_overload, value, dtype, device))
+
+
+@register_spyre_lowering(torch.ops.spyre.empty.default, type_promotion_kind=None)
+def lower_empty(size, device, dtype=None):
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    op_overload = getattr(
+        torch.ops.spyre.empty, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreEmptyFallback(op_overload, list(size), device, dtype)
+    )
