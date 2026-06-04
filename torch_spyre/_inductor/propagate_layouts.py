@@ -51,6 +51,7 @@ from .errors import Unsupported
 from . import config
 from .constants import (
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     COPY_BACK_CANDIDATE_ATTR,
     ELIDED_COPY_BACK_ATTR,
     TOPK_OPS,
@@ -773,7 +774,10 @@ def compute_layouts(
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
+    if isinstance(data, Reduction) and data.reduction_type in [
+        BATCH_MATMUL_OP,
+        BATCH_MATMUL_FP8_OP,
+    ]:
         return _matmul_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":

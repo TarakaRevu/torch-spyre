@@ -29,6 +29,7 @@ from torch_spyre._inductor.constants import (
     MATMUL_LAYOUT_LABELS,
     RESTICKIFY_OP,
     TOPK_OPS,
+    BATCH_MATMUL_FP8_OP,
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -237,8 +238,8 @@ def _get_device_dim_order(
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
-    stick_dim_order: Symbol | None,
-    stick_size: int,
+    stick_dim_order: list,
+    stick_size: list,
     layout_labels: list[str],
 ) -> str:
     for label, layout in layouts.items():
@@ -273,14 +274,18 @@ def _get_padded_iteration_space(
     padding: dict = {}
     for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
-        stick_dim = layout["stick_dim_order"]
+        stick_dim_order = layout["stick_dim_order"]
+        stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim != stick_dim:
+            if idx >= len(dev_size) or dim not in stick_dim_order:
                 continue
-            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            effective_stick_size = (
+                stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
+            )
+            unaligned = sdsc_iteration_space[dim] % effective_stick_size
             if unaligned > 0:
-                padding[dim] = layout["stick_size"] - unaligned
+                padding[dim] = effective_stick_size - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
 
@@ -391,12 +396,25 @@ def _create_sdsc_tensors(
             offsets[mb_sym] = 0
             max_dim_sizes[mb_sym] = -1
 
-        effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
+
+        # Special handling for FP8 matmul KERNEL tensor
+        is_fp8_matmul = op_spec.op == BATCH_MATMUL_FP8_OP
+        is_kernel_tensor = is_fp8_matmul and len(sdsc_args) == 1
+        base_stick_size = arg.device_dtype.elems_per_stick()
+        if is_kernel_tensor:
+            # FP8 KERNEL needs 2D stick: [2, stick_size/2]
+            layout_stick_size = [2, base_stick_size // 2]
+            # Use the last two dimensions from dim_order for 2D stick
+            effective_stick = dim_order[-2:]
+        else:
+            layout_stick_size = [base_stick_size]
+
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
-            arg.device_dtype.elems_per_stick(),
+            layout_stick_size,
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
         # Change dataFormat_ value if needed.

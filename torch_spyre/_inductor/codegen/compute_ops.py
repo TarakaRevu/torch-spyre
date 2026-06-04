@@ -508,9 +508,10 @@ def generate_sdsc(
                                         str(dim) for dim in layout_info["dim_order"]
                                     ],
                                     "stickDimOrder_": [
-                                        str(layout_info["stick_dim_order"])
+                                        str(dim)
+                                        for dim in layout_info["stick_dim_order"]
                                     ],
-                                    "stickSize_": [layout_info["stick_size"]],
+                                    "stickSize_": layout_info["stick_size"],
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
@@ -586,9 +587,10 @@ def generate_sdsc(
                                                 else 1,
                                                 elems_per_stick=tensor.data_format.elems_per_stick(),
                                                 is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
+                                                    dim
+                                                    in sdsc_spec.layouts[tensor.layout][
                                                         "stick_dim_order"
-                                                    ].has(dim)
+                                                    ]
                                                 ),
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
