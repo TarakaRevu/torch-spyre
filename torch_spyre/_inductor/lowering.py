@@ -326,6 +326,25 @@ def lower_scaled_mm(
 
     result.realize()
 
+       # Apply activation scale (per-token)
+    if scale_a is not None:
+        scale_a.realize()
+        result = lowering.mul(result, scale_a)
+        result.realize()
+
+    # Apply weight scale (per-channel)
+    if scale_b is not None:
+        scale_b.realize()
+        result = lowering.mul(result, scale_b)
+        result.realize()
+
+    if bias is not None:
+        logger.warning("bias parameter in _scaled_mm is not yet supported")
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
@@ -335,7 +354,6 @@ def lower_scaled_mm(
         )
 
     return result
-
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
@@ -1102,3 +1120,62 @@ def lower_minimum(x, y):
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+    x.realize()
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.quantize_fp8_with_scale)
+def lower_quantize_fp8_with_scale(x, scale):
+    """
+    Lower quantize_fp8_with_scale operation.
+
+    Composes four operations:
+    1. Compute inverse scale using reciprocal (POINTWISE, sfp unit)
+    2. Multiply by inverse scale (POINTWISE)
+    3. Clamp to FP8 range [-448, 448] (POINTWISE)
+    4. Convert to FP8 format using qfp8ch (POINTWISE format conversion)
+    """
+    x.realize()
+    scale.realize()
+
+    # Step 1: Compute inverse scale using reciprocal
+    inv_scale = lowering.reciprocal(scale)
+    inv_scale.realize()  # Force realization to prevent fusion
+
+    # Step 2: Multiply by inverse scale
+    x_scaled = lowering.mul(x, inv_scale)
+    x_scaled.realize()  # Force realization to prevent fusion
+
+    # Step 3: Clamp to FP8 E4M3 range
+    x_clamped = lower_clamp(x_scaled, -448.0, 448.0)
+    x_clamped.realize()  # Force realization to prevent fusion
+
+    # Step 4: Convert to FP8 format
+    x_fp8 = lower_qfp8ch(x_clamped)
+
+    return x_fp8
