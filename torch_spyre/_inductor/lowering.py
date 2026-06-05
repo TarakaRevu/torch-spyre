@@ -326,6 +326,25 @@ def lower_scaled_mm(
 
     result.realize()
 
+    # Apply activation scale (per-token)
+    if scale_a is not None:
+        scale_a.realize()
+        result = lowering.mul(result, scale_a)
+        result.realize()
+
+    # Apply weight scale (per-channel)
+    if scale_b is not None:
+        scale_b.realize()
+        result = lowering.mul(result, scale_b)
+        result.realize()
+
+    if bias is not None:
+        logger.warning("bias parameter in _scaled_mm is not yet supported")
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(

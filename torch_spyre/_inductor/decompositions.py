@@ -692,6 +692,25 @@ def sub_with_alpha(
         return torch.sub(self, scaled_other)
 
 
+# Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
+@decomp.register_decomposition(
+    [torch.ops.spyre.dequantize_fp8_with_scale], spyre_decompositions
+)
+def dequantize_fp8_with_scale_decomp(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """
+    Decompose dequantize_fp8_with_scale into:
+    1. FP8→FP16 conversion using .to() (triggers fp8todl16 via dtype_ops)
+    2. Multiply by scale
+
+    This decomposition is executed during compilation and removes the custom op
+    from the graph before lowering.
+    """
+    x_fp16 = input.to(torch.float16)
+    return x_fp16 * scale
+
+
 @register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
@@ -736,3 +755,18 @@ def where_scalar_decomp(condition, self, other):
 # called directly; outside (eager mode) the pre-compiled wrapper is used.
 # Note: This has to stay at the end of the file.
 _register_spyre_dispatchkey_kernels_permanently()
+
+
+@decomp.register_decomposition(
+    [torch.ops.spyre.compute_fp8_scale], spyre_decompositions
+)
+def compute_fp8_scale_decomp(input: torch.Tensor) -> torch.Tensor:
+    """
+    Decompose compute_fp8_scale into:
+    1. abs(input)
+    2. amax over all dims
+    3. divide by FP8_MAX (448.0)
+    """
+    FP8_MAX = torch.tensor(448.0, dtype=torch.float16, device=input.device)
+    abs_max = torch.amax(input.abs())
+    return (abs_max / FP8_MAX).to(torch.float16)
