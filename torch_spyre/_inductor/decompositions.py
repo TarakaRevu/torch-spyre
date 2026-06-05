@@ -691,7 +691,6 @@ def sub_with_alpha(
         scaled_other = torch.mul(other, alpha)
         return torch.sub(self, scaled_other)
 
-
 @register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
@@ -736,3 +735,18 @@ def where_scalar_decomp(condition, self, other):
 # called directly; outside (eager mode) the pre-compiled wrapper is used.
 # Note: This has to stay at the end of the file.
 _register_spyre_dispatchkey_kernels_permanently()
+
+
+@decomp.register_decomposition(
+    [torch.ops.spyre.compute_fp8_scale], spyre_decompositions
+)
+def compute_fp8_scale_decomp(input: torch.Tensor) -> torch.Tensor:
+    """
+    Decompose compute_fp8_scale into:
+    1. abs(input)
+    2. amax over all dims
+    3. divide by FP8_MAX (448.0)
+    """
+    FP8_MAX = torch.tensor(448.0, dtype=torch.float16, device=input.device)
+    abs_max = torch.amax(input.abs())
+    return (abs_max / FP8_MAX).to(torch.float16)

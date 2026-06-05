@@ -458,3 +458,20 @@ def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 @to_dtype_cpu.register_fake
 def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
+
+
+@torch.library.custom_op(
+    "spyre::compute_fp8_scale", mutates_args=(), device_types="spyre"
+)
+def compute_fp8_scale(input: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Compute per-tensor FP8 quantization scale from FP16 input.
+    scale = max(|input|) / FP8_MAX  where FP8_MAX = 448.0
+    Returns a scalar FP16 tensor.
+    """
+    pass
+
+
+@compute_fp8_scale.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    return torch.empty((), dtype=torch.float16, device=input.device)
