@@ -249,12 +249,11 @@ def lower_scaled_mm(
     out_dtype=None,
     use_fast_accum=False,
 ):
-    if scale_a is not None:
-        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
-    if scale_b is not None:
-        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
+    
     if bias is not None:
-        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
+        bias.realize()
+        result = lowering.add(result, bias)
+        result.realize()
     if scale_result is not None:
         raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
     if use_fast_accum:
