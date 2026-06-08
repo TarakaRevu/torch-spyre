@@ -337,8 +337,6 @@ def lower_scaled_mm(
         result = lowering.mul(result, scale_b)
         result.realize()
 
-    if bias is not None:
-        logger.warning("bias parameter in _scaled_mm is not yet supported")
     if scale_result is not None:
         logger.warning("scale_result parameter in _scaled_mm is not yet supported")
     if use_fast_accum:
