@@ -812,6 +812,14 @@ def where_scalar_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
+@decomp.register_decomposition(
+    [torch.ops.spyre.compute_fp8_scale], spyre_decompositions
+)
+def compute_fp8_scale_decomp(input: torch.Tensor) -> torch.Tensor:
+    abs_max = torch.amax(input.abs())
+    return (abs_max / 448.0).to(torch.float16)
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
