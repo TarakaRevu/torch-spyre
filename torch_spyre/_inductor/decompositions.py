@@ -644,93 +644,11 @@ def spyre_min_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.min((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.cat.default])
-def decompose_cat(
-    tensors: list[torch.Tensor],
-    dim: int = 0,
-) -> torch.Tensor:
-    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
-    if orig_decomp == NotImplemented:
-        expanded_size = 0
-        for t in tensors:
-            expanded_size += t.size(dim)
-        output_size = list(tensors[0].size())
-        output_size[dim] = expanded_size
-        output = tensors[0].new_empty(output_size)
-        offset = 0
-        for input in tensors:
-            output = torch.ops.spyre.overwrite_f(
-                input=input, output=output, dims=[dim], offsets=[offset]
-            )
-            offset += input.size(dim)
-        return output
-    else:
-        return orig_decomp
-
-
 @register_spyre_decomposition([torch.ops.aten.ceil.default])
 def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
-
-
-@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
-def pad_decomp(
-    input: torch.Tensor,
-    pad: list[int],
-    value: float = 0,
-) -> torch.Tensor:
-    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
-    n_dims_padded = len(pad) // 2
-
-    # Negative pad values (cropping) require reading from a non-zero storage
-    # offset or a sub-stick position, neither of which the SFP supports.
-    if any(p < 0 for p in pad):
-        raise Unsupported(
-            f"constant_pad_nd: negative padding (cropping) is not supported on "
-            f"Spyre (pad={pad})"
-        )
-
-    # Left-padding on the last (stick) dimension shifts the output start address
-    # by `left` elements. The hardware can only express this in whole sticks, so
-    # `left` must be a multiple of the stick size (64 fp16 elements).
-    # Sub-stick left-padding on the last dimension is tracked in:
-    # https://github.com/torch-spyre/torch-spyre/issues/1464
-    last_dim_left = pad[0]
-    if last_dim_left > 0:
-        elems_per_stick = 128 // input.element_size()
-        if last_dim_left % elems_per_stick != 0:
-            raise Unsupported(
-                f"constant_pad_nd: sub-stick left-padding on the last dimension is "
-                f"not supported on Spyre (pad={pad}, left={last_dim_left}, "
-                f"stick_size={elems_per_stick})"
-            )
-
-    # Build the padded output shape and collect which dimensions need padding.
-    output_size = list(input.size())
-    dims: list[int] = []
-    offsets: list[int] = []
-    for i in range(n_dims_padded - 1, -1, -1):
-        left = pad[2 * i]
-        right = pad[2 * i + 1]
-        if left + right == 0:
-            continue
-        dim = input.dim() - 1 - i
-        output_size[dim] += left + right
-        dims.append(dim)
-        offsets.append(left)
-
-    if not dims:
-        return input
-
-    output = torch.ops.aten.full(
-        output_size, value, dtype=input.dtype, device=input.device
-    )
-    output = torch.ops.spyre.overwrite_f(
-        input=input, output=output, dims=dims, offsets=offsets
-    )
-    return output
 
 
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
@@ -754,24 +672,124 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
-@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
-def sub_with_alpha(
-    self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
+@register_spyre_decomposition([torch.ops.aten.convolution.default])
+def conv2d_via_bmm_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    groups: int,
 ) -> torch.Tensor:
     """
-    Decompose torch.sub(a, b, alpha=alpha) into separate mul and sub operations.
-
-    The Spyre backend does not have a single operation for a - alpha * b.
-    When alpha != 1, we decompose into: a - (alpha * b)
-    This ensures the operations are not fused by Inductor's optimization passes.
+    Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
+    torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
+    intermediate reshape/view/unsqueeze operations.
     """
-    if alpha == 1:
-        # Simple subtraction without alpha - use default behavior
-        return NotImplemented
+    if transposed:
+        raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
+
+    if any(op != 0 for op in output_padding):
+        raise Unsupported("conv2d_via_bmm: output_padding not supported")
+
+    if input.dim() != 4:
+        raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
+
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    stride_h, stride_w = stride[0], stride[1]
+    pad_h, pad_w = padding[0], padding[1]
+    dil_h, dil_w = dilation[0], dilation[1]
+
+    if C_in != groups * C_in_per_group:
+        raise Unsupported(
+            f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
+        )
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    patches = torch.ops.spyre.unfold(
+        input,
+        kernel_size=(K_h, K_w),
+        dilation=(dil_h, dil_w),
+        padding=(pad_h, pad_w),
+        stride=(stride_h, stride_w),
+    )
+
+    if groups == 1:
+        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
+        weight_2d = torch.ops.spyre.reshape_via_cpu(
+            weight, (C_out, C_in_per_group * K_h * K_w)
+        )
+        weight_2d_exp = weight_2d.unsqueeze(0).expand(N, -1, -1)
+        weight_2d_exp_cln = weight_2d_exp.clone()
+        # output = torch.matmul(weight_2d, patches)
+        output = torch.matmul(weight_2d_exp_cln, patches)
     else:
-        # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
-        scaled_other = torch.mul(other, alpha)
-        return torch.sub(self, scaled_other)
+        C_out_per_group = C_out // groups
+        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        patches = torch.ops.spyre.reshape_via_cpu(
+            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        )
+        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        weight_grouped = torch.ops.spyre.reshape_via_cpu(
+            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        )
+
+        output = torch.matmul(
+            weight_grouped.unsqueeze(0),
+            patches,
+        )
+        output = output.reshape(N, C_out, H_out * W_out)
+
+    output = output.reshape(N, C_out, H_out, W_out)
+
+    if bias is not None:
+        # To ensure stick compatibility: reshape bias via reshape_via_cpu to (1, C_out, 1, 1).
+        # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
+        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
+        output = output + bias_shaped
+
+    return output
+
+
+@register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
+def where_scalar_other_decomp(condition, self, other):
+    other_t = torch.full_like(self, other)
+    return torch.ops.aten.where.self(condition, self, other_t)
+
+
+@register_spyre_decomposition([torch.ops.aten.where.ScalarSelf])
+def where_scalar_self_decomp(condition, self, other):
+    self_t = torch.full_like(other, self)
+    return torch.ops.aten.where.self(condition, self_t, other)
+
+
+@register_spyre_decomposition([torch.ops.aten.where.Scalar])
+def where_scalar_decomp(condition, self, other):
+    # Must use dtype float16 for spyre backend where3
+    dtype = torch.float16
+
+    # Use full.default instead of full_like to explicitly control dtype
+    self_t = torch.ops.aten.full.default(
+        list(condition.shape),
+        self,
+        dtype=dtype,
+        device=condition.device,
+    )
+    other_t = torch.ops.aten.full.default(
+        list(condition.shape),
+        other,
+        dtype=dtype,
+        device=condition.device,
+    )
+
+    return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
 ###############################################################################################

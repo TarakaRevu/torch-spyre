@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "flex/flex.hpp"
+#include "job_plan.h"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
@@ -143,12 +144,6 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
   DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
 
-  // TODO(tmhoangt): add type conversion node
-  // Type checking - no type conversion support yet
-  TORCH_CHECK(
-      src.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
-
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
   bool device2host = src.is_privateuseone() && dst.is_cpu();
@@ -238,6 +233,32 @@ void SpyreStream::executeProgramAsync(
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
   flex_stream->launchOperation(compute_op);
+}
+
+void SpyreStream::launch(const JobPlan& plan,
+                         const std::vector<at::Tensor>& args) const {
+  // Validate all tensors are on Spyre device
+  for (size_t i = 0; i < args.size(); ++i) {
+    TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
+                " must be on Spyre device, got ", args[i].device());
+  }
+
+  // Create launch context with tensor arguments
+  LaunchContext ctx{args};
+
+  // Construct RuntimeOperations from each JobPlanStep
+  std::vector<std::unique_ptr<flex::RuntimeOperation>> operations;
+  operations.reserve(plan.steps.size());
+
+  for (const auto& step : plan.steps) {
+    operations.push_back(step->construct(ctx));
+  }
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+
+  // Submit all operations to the stream
+  flex_stream->launchOperation(operations);
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

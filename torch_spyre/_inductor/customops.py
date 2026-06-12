@@ -17,6 +17,7 @@ import torch
 import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
+from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
@@ -289,7 +290,7 @@ def overwrite_cpu(
 ) -> None:
     sliced_t = output
     for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
     sliced_t.copy_(input)
 
 
@@ -360,6 +361,91 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
     values = input.new_empty(output_shape)
     indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     return (values, indices)
+
+
+@torch.library.custom_op("spyre::unfold", mutates_args=(), device_types="spyre")
+def spyre_unfold(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    dilation: Optional[Sequence[int]] = None,
+    padding: Optional[Sequence[int]] = None,
+    stride: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    """
+    Im2col unfold operation via torch.nn.functional.unfold.
+    Converts (N, C, H, W) input to (N, C*K_h*K_w, L) where L = H_out * W_out.
+    Uses CPU fallback for the unfold operation.
+    """
+
+    dilation = dilation or (1, 1)
+    padding = padding or (0, 0)
+    stride = stride or (1, 1)
+
+    warn_fallback("torch.ops.spyre.unfold")
+    # Move to CPU, perform unfold, move back to Spyre
+    input_cpu = input.to("cpu")
+    result_cpu = torch.nn.functional.unfold(
+        input_cpu,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+    return result_cpu.to(input.device)
+
+
+@spyre_unfold.register_fake
+def _(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    dilation: Optional[Sequence[int]] = None,
+    padding: Optional[Sequence[int]] = None,
+    stride: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    dilation = dilation or (1, 1)
+    padding = padding or (0, 0)
+    stride = stride or (1, 1)
+
+    N, C, H_in, W_in = input.shape
+    K_h, K_w = kernel_size
+    dil_h, dil_w = dilation
+    pad_h, pad_w = padding
+    stride_h, stride_w = stride
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    return input.new_empty((N, C * K_h * K_w, H_out * W_out))
+
+
+@torch.library.custom_op(
+    "spyre::reshape_via_cpu", mutates_args=(), device_types="spyre"
+)
+def spyre_reshape_via_cpu(
+    input: torch.Tensor,
+    shape: Sequence[int],
+) -> torch.Tensor:
+    """
+    Reshape operation that executes on CPU to avoid stick-alignment issues.
+
+    When reshaping produces a shape with innermost dimension that doesn't align
+    with stick boundaries (64 elements for fp16), the Inductor coordinate
+    computation fails. This op moves to CPU, reshapes, then moves back to Spyre.
+
+    This is similar to unfold, which also uses CPU fallback for correct layouts.
+    """
+    warn_fallback("torch.ops.spyre.reshape_via_cpu")
+    input_cpu = input.to("cpu")
+    result_cpu = input_cpu.reshape(shape)
+    return result_cpu.to(input.device)
+
+
+@spyre_reshape_via_cpu.register_fake
+def _(
+    input: torch.Tensor,
+    shape: Sequence[int],
+) -> torch.Tensor:
+    return input.new_empty(shape)
 
 
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
@@ -446,3 +532,14 @@ def _constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
 ) -> torch.types.Number:
     return fill_value
+
+
+@torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
+def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    warn_fallback(f"conversion from {input.dtype} to {dtype}")
+    return input.cpu().to(dtype=dtype).to(input.device)
+
+
+@to_dtype_cpu.register_fake
+def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty_like(input, dtype=dtype)

@@ -241,6 +241,7 @@ register_fallback_default(
         aten.arange,
         aten.sin,
         aten.cos,
+        aten.ne.Scalar_out,
         aten.embedding.default,
         aten.isin,
         aten.tril,
@@ -251,6 +252,8 @@ register_fallback_default(
         aten.bitwise_or.Tensor_out,
         aten.argmax.default,
         aten.argmin.default,
+        aten.where.default,
+        aten.index_copy.out,
     ]
 )
 
@@ -260,6 +263,7 @@ register_fallback_default(
 # and would leave the original Spyre tensor unfilled.
 # The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
+fallback_ops.append(getattr(aten.random_, "from"))
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])

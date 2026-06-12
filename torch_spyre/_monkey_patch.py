@@ -74,12 +74,8 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
         if device_layout is None:
-            # If caller is doing a combined device+dtype move on a Spyre tensor
-            # (e.g. tensor.to("spyre", dtype=torch.int64) or
-            #        tensor.to(device="spyre", dtype=torch.int64)),
-            # split into two steps: cast dtype on CPU first, then copy to device.
-            # This avoids "does not support type conversion during copy" in the
-            # DCI (DataConversionInfo) C++ code in spyre_mem.cpp.
+            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in spyre_mem.cpp.
+            # For D2D data casting, split it into a D2H copy and a H2D dtype conversion.
             _device = kwargs.get("device", None)
             if (
                 _device is None
@@ -95,12 +91,19 @@ def _patch_tensor_for_spyre():
                 _device is not None
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
+                and torch.device(_device).type == DEVICE_NAME
             ):
-                # Step 1: cast dtype on CPU
-                tmp = orig_to(self, dtype=_dtype)
-                # Step 2: plain H2D copy with no dtype change
-                return orig_to(tmp, _device)
+                import warnings
 
+                warnings.warn(
+                    "D2D dtype conversion on Spyre is not directly supported. "
+                    "Using CPU as an intermediate for the cast.",
+                    stacklevel=2,
+                )
+                # Step 1: plain D2H copy (no dtype change)
+                tmp = orig_to(self, "cpu")
+                # Step 2: cast dtype via H2D
+                return orig_to(tmp, _device, dtype=_dtype)
             return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
@@ -231,3 +234,55 @@ def _patch_tensor_for_spyre():
         )
 
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
+    # ───────────────────FxGraph Cache Key Extension ───────────────────
+    # Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key
+    # preventing incorrect disk cache hits across process boundaries.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_fx_graph_hash()
+
+
+def _patch_fx_graph_hash():
+    """
+    Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key.
+    """
+    import torch
+    from torch._inductor.codecache import FxGraphHashDetails
+    from torch._inductor.virtualized import V
+
+    if getattr(FxGraphHashDetails, "_spyre_hash_patched", False):
+        return
+
+    original_init = FxGraphHashDetails.__init__
+
+    def _spyre_init(self, gm, example_inputs, fx_kwargs, inputs_to_check):
+        # run original first — populates all standard hash fields
+        original_init(self, gm, example_inputs, fx_kwargs, inputs_to_check)
+
+        # V.get_real_inputs() returns real Spyre tensors with SpyreTensorLayout
+        # before they become FakeTensors (which have no layout by design)
+
+        try:
+            real_inputs = V.get_real_inputs()
+        except RuntimeError:
+            return
+
+        # extract layout from real tensors, fallback to example_inputs
+        spyre_layouts = []
+        # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
+        inputs_to_use = (
+            real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
+        )
+
+        for inp in inputs_to_use:
+            if isinstance(inp, torch.Tensor):
+                layout = inp.device_tensor_layout()
+                spyre_layouts.append(layout)
+            else:
+                spyre_layouts.append(None)
+
+        # self.spyre_layouts added as field on FxGraphHashDetails
+        # PyTorch pickles ALL fields → spyre_layouts automatically in hash
+        self.spyre_layouts = spyre_layouts
+
+    FxGraphHashDetails.__init__ = _spyre_init
+    FxGraphHashDetails._spyre_hash_patched = True

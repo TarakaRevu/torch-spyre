@@ -122,7 +122,7 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt);
+                                      std::nullopt, flex::MemoryType::Tensor);
   return SpyreAllocator::allocate(nbytes, directive);
 }
 
@@ -144,6 +144,7 @@ c10::DataPtr SpyreAllocator::allocate(
   flex::CompositeAddress composite_addr =
       flex_alloc->allocate(nbytes, directive);
 
+  DEBUGINFO("allocated ", composite_addr);
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.
@@ -192,6 +193,10 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   // do nothing -- look into when this is called
   // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
   // reinterpret_cast<spyre_ptr_t>(src));
+}
+
+uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
+  return getFlexAllocator()->segmentForRegion(region_id);
 }
 
 // Register our custom allocator

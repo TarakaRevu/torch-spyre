@@ -19,17 +19,10 @@ after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
 Only y is padded; x is left untouched.
 
 For y, the following IR sequence is emitted:
-  spyre.empty(padded_size)                         — uninitialised allocation
-  spyre.constant(0.0)                              — scalar zero, generated on-device (cached)
-  aten.expand(constant, pad_size)                  — broadcast to pad-region shape; free
-  aten.clone(expand)                               — on-device broadcast copy → fill buffer
-  overwrite(fill_buf, empty, [dim], [fill_offset]) — write zeros into pad region
-  overwrite(orig,     empty, [dim], [0])           — copy original data at offset 0
-
-fill_offset is original_size[dim] rounded down to the nearest stick boundary.
-This ensures the fill overwrite is stick-aligned; any elements between
-fill_offset and original_size[dim] that are over-zeroed are restored by the
-data overwrite, which always runs after the fill overwrite.
+  1. ComputedBuffer - output buffer allocation (FixedLayout)
+  2. SpyreConstantFallback - fill constant (FixedLayout)
+  3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+  4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
 
 y's padded buffer is built at the full K_padded host size by lower_pad_sequence.
 reduction_ranges stays at K; the K→K_padded extension happens at SDSC codegen
@@ -41,9 +34,8 @@ x is left physically untouched.  The hardware masks within-stick elements of x
 beyond the true K to zero, so extending the SDSC iteration to K_padded does not
 introduce numerical error from x.
 
-spyre.constant is cached across all matmuls with the same (fill_value, device,
-dtype) key so it is lowered at most once per unique fill value and dtype,
-regardless of tensor shape or which dimension is padded.
+Deduplication of identical constants across multiple pad calls happens later
+at the IR level via dedup_and_promote_constants.
 
 x and y are identified via device_coordinates: x is the input sticked on the
 reduction coord, y is the other.  This avoids positional assumptions and handles
@@ -51,6 +43,7 @@ square matrices (M==K==N) correctly.
 """
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -189,7 +182,7 @@ def _rebuild_matmul(
     return replace_computed_buffer_body(op, reduction, operations)
 
 
-def insert_bmm_padding(operations: list[Operation]) -> None:
+def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
 
@@ -207,6 +200,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
     """
+    operations = graph.operations
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -228,7 +222,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         # makes reduction_coord detection fail for both inputs.
         k_val = concretize_expr(reduction.reduction_ranges[0])
         first_buf = next(
-            (V.graph.get_buffer(d.name) for d in reads if V.graph.get_buffer(d.name)),
+            (graph.get_buffer(d.name) for d in reads if graph.get_buffer(d.name)),
             None,
         )
         assert first_buf is not None, (
@@ -251,7 +245,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         y_dep = None
         y_host_k_dim: int | None = None
         for dep in reads:
-            buf = V.graph.get_buffer(dep.name)
+            buf = graph.get_buffer(dep.name)
             if buf is None:
                 continue
             layout = buf.get_layout()
@@ -287,8 +281,8 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
 
         x_name = x_dep.name
         y_name = y_dep.name
-        x_buf = V.graph.get_buffer(x_name)
-        y_buf = V.graph.get_buffer(y_name)
+        x_buf = graph.get_buffer(x_name)
+        y_buf = graph.get_buffer(y_name)
         if x_buf is None or y_buf is None:
             continue
 
@@ -305,8 +299,8 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         # mm_to_bmm_pass may wrap a 2D x buffer with a 3D view; we need the
         # loader to accept x_size-dimensional indices (len(output_ranges) dims).
         x_view_fx = _find_arg_fx_node(x_name, expected_size=x_size)
-        _patch_env(V.graph)
-        x_view_buf = V.graph.env[x_view_fx]
+        _patch_env(graph)
+        x_view_buf = graph.env[x_view_fx]
 
         k_padded = k_val + pad
 

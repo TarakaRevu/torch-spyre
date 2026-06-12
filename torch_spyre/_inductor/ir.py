@@ -95,6 +95,7 @@ class FixedTiledLayout(FixedLayout):
         super().__init__(device, dtype, size, stride)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
+        self.per_tile_fixed: bool = False
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
@@ -155,6 +156,9 @@ class SpyreEmptyFallback(ir.ExternKernel):
         pass
 
     def should_allocate(self) -> bool:
+        layout = self.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return False
         return True
 
     def get_mutation_names(self) -> Sequence[str]:

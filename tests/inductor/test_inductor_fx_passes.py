@@ -190,6 +190,76 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         assert spyre_1 != cpu_1, "SPYRE graph should differ from CPU graph"
 
+    def test_concretize_index_with_symbolic_shapes(self):
+        """
+        Test that concretize_index handles unconvertible symbolic expressions.
+
+        Regression test for: "TypeError: Cannot convert symbols to int"
+        that occurred in index_copy operations with symbolic shapes.
+        """
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import concretize_index
+
+        # Create symbolic variables
+        x = sympy.Symbol("x")  # Loop variable
+        tmp0 = sympy.Symbol("tmp0")  # Unconvertible symbol
+
+        # Create expression: x + tmp0
+        index = x + tmp0
+        loop_vars = {x}
+
+        # Mock size_hint to raise TypeError for tmp0
+        with patch("torch_spyre._inductor.pass_utils.V") as mock_v:
+            mock_v.graph.sizevars.size_hint.side_effect = TypeError(
+                "Cannot convert symbols to int"
+            )
+
+            # Should NOT raise, should return original index
+            result = concretize_index(index, loop_vars)
+            assert result == index, f"Expected {index}, got {result}"
+
+    def test_compute_max_size(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import compute_max_size
+
+        # branches that need no V.graph
+        assert compute_max_size(42) == 42
+        assert compute_max_size(sympy.Integer(7)) == 7
+        assert compute_max_size(sympy.Integer(3) + sympy.Integer(4)) == 7
+
+        s = sympy.Symbol("s0", integer=True, positive=True)
+
+        # finite upper bound: return it
+        mock_v = SimpleNamespace(
+            graph=SimpleNamespace(
+                sizevars=SimpleNamespace(
+                    shape_env=SimpleNamespace(
+                        bound_sympy=lambda _e: SimpleNamespace(upper=sympy.Integer(576))
+                    ),
+                    size_hint=lambda _e: 128,
+                )
+            )
+        )
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            assert compute_max_size(s) == 576
+
+        # infinite upper: fall back to size_hint
+        mock_v2 = SimpleNamespace(
+            graph=SimpleNamespace(
+                sizevars=SimpleNamespace(
+                    shape_env=SimpleNamespace(
+                        bound_sympy=lambda _e: SimpleNamespace(upper=sympy.oo)
+                    ),
+                    size_hint=lambda _e: 64,
+                )
+            )
+        )
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v2):
+            assert compute_max_size(s) == 64
+
 
 if __name__ == "__main__":
     unittest.main()
