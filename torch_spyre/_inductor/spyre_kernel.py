@@ -19,7 +19,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -504,6 +504,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
+            element_arrangement=tensor.layout.device_layout.element_arrangement,
             name=opspec_name,
         )
         if (
@@ -958,6 +959,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
+                            if arg.element_arrangement != ElementArrangement.STANDARD:
+                                buf.writeline(
+                                    f"element_arrangement={arg.element_arrangement},"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
