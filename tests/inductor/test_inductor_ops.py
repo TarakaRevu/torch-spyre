@@ -4086,6 +4086,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
         },
+        (
+            "test_fp8_scaled_mm",
+            "test_fp8_scaled_mm_cpu",
+        ): {
+            "param_sets": {
+                "2x128x128": (
+                    torch.rand((2, 128), dtype=torch.float16),
+                    torch.rand((128, 128), dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                ),
+                "128x128x128": (
+                    torch.rand((128, 128), dtype=torch.float16),
+                    torch.rand((128, 128), dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5704,6 +5723,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b):
+        """Test _scaled_mm with FP8 inputs."""
+
+        def spyre_fn(a, b, scale_a, scale_b):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
+            q_b = torch.ops.spyre.quantize_fp8_with_scale(b, scale_b)
+            return torch.ops.aten._scaled_mm(
+                q_a, q_b, scale_a, scale_b, bias=None, out_dtype=torch.float16
+            )
+
+        def pytorch_fn(a, b, scale_a, scale_b):
+            q_a = (a / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            q_b = (b / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            return (q_a.to(torch.float16) @ q_b.to(torch.float16)) * (scale_a * scale_b)
+
+        self.compare_with_cpu(
+            spyre_fn, pytorch_fn, a, b, scale_a, scale_b, atol=0.1, rtol=0.1
+        )
+
     def test_is_nonzero_cpu(self, *args):
         """Test torch.is_nonzero on Spyre tensors"""
         if len(args) == 1:
