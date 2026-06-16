@@ -19,7 +19,7 @@ from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -334,10 +334,14 @@ def _create_sdsc_tensors(
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
+    is_fp8_matmul = op_spec.op in (BATCH_MATMUL_FP8_OP)
 
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
+        is_fp8_mm_kernel_arg = (
+            is_fp8_matmul and arg.element_arrangement == ElementArrangement.QFP8WT
+        )
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
@@ -399,16 +403,14 @@ def _create_sdsc_tensors(
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
 
         # Special handling for FP8 matmul KERNEL tensor
-        is_fp8_matmul = op_spec.op == BATCH_MATMUL_FP8_OP
-        is_kernel_tensor = is_fp8_matmul and len(sdsc_args) == 1
-        base_stick_size = arg.device_dtype.elems_per_stick()
-        if is_kernel_tensor:
+        dtype_stick_size = arg.device_dtype.elems_per_stick()
+        if is_fp8_mm_kernel_arg:
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
-            layout_stick_size = [2, base_stick_size // 2]
+            layout_stick_size = [2, dtype_stick_size // 2]
             # Use the last two dimensions from dim_order for 2D stick
             effective_stick = dim_order[-2:]
         else:
-            layout_stick_size = [base_stick_size]
+            layout_stick_size = [dtype_stick_size]
 
         label = _get_layout_label(
             layouts,
