@@ -45,6 +45,7 @@ enum class ElementArrangement {
                  // operations
   EXX2,          // reduction mode: two values per stick (vs. one for standard
                  // reductions)
+  QFP8WT,        // 2D stick layout for FP8 weight tensors
 };
 
 class SpyreTensorLayout {
