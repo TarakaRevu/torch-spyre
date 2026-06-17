@@ -296,8 +296,8 @@ def adjust_it_space_for_sticks(
     for td in tensor_deps:
         # Handle QFP8WT multi-dim stick
         if (
-            hasattr(td.layout, "element_arrangement")
-            and td.layout.element_arrangement == ElementArrangement.QFP8WT
+            hasattr(td.layout.device_layout, "element_arrangement")
+            and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
         ):
             # For QFP8WT, last two device dimensions are the 2D stick [2, 64]
             # Both need to be treated as atomic 128-byte units
