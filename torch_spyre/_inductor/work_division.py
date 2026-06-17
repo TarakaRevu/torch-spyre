@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
@@ -271,6 +272,9 @@ def adjust_it_space_for_sticks(
     convert its size in it_space from elements to sticks. This ensures work
     division treats sticks as atomic units.
 
+    For QFP8WT tensors (2D stick layouts), both stick dimensions are treated as
+    atomic units with 128-byte constraint.
+
     When tensors of different dtypes share a stick variable (e.g. a float16
     input and an int64 argmax output), the largest elems_per_stick is used
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
@@ -290,6 +294,27 @@ def adjust_it_space_for_sticks(
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
+        # Handle QFP8WT multi-dim stick
+        if (
+            hasattr(td.layout, "element_arrangement")
+            and td.layout.element_arrangement == ElementArrangement.QFP8WT
+        ):
+            # For QFP8WT, last two device dimensions are the 2D stick [2, 64]
+            # Both need to be treated as atomic 128-byte units
+            stick_vars = []
+            for coord in td.device_coords[-2:]:
+                if len(coord.free_symbols) == 1:
+                    var = next(iter(coord.free_symbols))
+                    if var in adjusted_space:
+                        stick_vars.append(var)
+
+            for stick_var in stick_vars:
+                # QFP8WT stick size is always 128 bytes (64 elements at fp8)
+                fp8_stick_elems = td.layout.device_layout.elems_per_stick()
+                if stick_var not in max_elems or fp8_stick_elems > max_elems[stick_var]:
+                    max_elems[stick_var] = fp8_stick_elems
+            continue
+
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
             continue
