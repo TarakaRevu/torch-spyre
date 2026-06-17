@@ -1150,15 +1150,15 @@ def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
 
 
-@register_spyre_lowering(torch.ops.spyre.qfp8ch)
-def lower_qfp8ch(x):
+@register_spyre_lowering(torch.ops.spyre.qfp8wt)
+def lower_qfp8wt(x):
     """
-    Lower qfp8ch operation - channel-wise FP8 format conversion.
-
+    Lower qfp8wt operation - weight FP8 format conversion with 2D stick layout.
     Pointwise format conversion only (no scaling).
     """
+    x.realize()
 
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
     x_loader = x.make_loader()
 
     def inner_fn(index):
@@ -1176,15 +1176,15 @@ def lower_qfp8ch(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.qfp8wt)
-def lower_qfp8wt(x):
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
     """
     Lower qfp8ch operation - channel-wise FP8 format conversion.
 
     Pointwise format conversion only (no scaling).
     """
 
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
     x_loader = x.make_loader()
 
     def inner_fn(index):

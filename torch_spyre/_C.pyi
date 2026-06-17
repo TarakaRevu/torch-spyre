@@ -148,7 +148,7 @@ class ElementArrangement:
     ]  # value = <ElementArrangement.STANDARD: 0>
     __members__: typing.ClassVar[
         dict[str, ElementArrangement]
-    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>}
+    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>, 'QFP8WT': <ElementArrangement.QFP8WT: 4>}
     @property
     def name(self) -> str: ...
     @property
