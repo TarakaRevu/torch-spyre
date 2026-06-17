@@ -293,11 +293,15 @@ def _single_arg_op_layout(
             )
             return [stl]
 
-        case spyreop.qfp8ch.default:
+        case spyreop.qfp8ch.default | spyreop.qfp8wt.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
             # preserving any padding present in the input STL.
-            elem_arr = ElementArrangement.QFP8CH
+            elem_arr = (
+                ElementArrangement.QFP8CH
+                if aten_op == spyreop.qfp8ch.default
+                else ElementArrangement.QFP8WT
+            )
             in_eps = get_elem_in_stick(in_layout.dtype)
             out_eps = get_elem_in_stick(output.dtype)
             out_device_size = list(stl.device_size)
