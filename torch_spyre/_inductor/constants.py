@@ -20,6 +20,7 @@ BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
+FP8TODL16_OP = "fp8todl16"
 
 DEVICE_NAME = "spyre"
 
@@ -87,6 +88,7 @@ SPYRE_FP32_OPS = [
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {
     "batchmatmulfp8",  # FP8 bmm (inputs: FP8)
+    "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)
     "qfp8wt",  # FP8 quantization (output: FP8)
 }
 

@@ -153,6 +153,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
           - name: Inductor Ops Misc Compute
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops FP8
+            config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar

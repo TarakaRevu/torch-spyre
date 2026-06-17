@@ -1,0 +1,18 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_(fp8_weight_quantization_roundtrip|dequantize_fp8_with_scale).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-fp8
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_fp8_operations.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestFP8Operations::test_(quantize_fp8_with_scale_basic|qfp8ch_basic_conversion|qfp8ch_production_shape|dequantize_fp8_with_scale_decomp_correctness).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-fp8-operations
