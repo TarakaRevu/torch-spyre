@@ -21,7 +21,7 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME, FP8_E4M3_MAX
+from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from . import customops  # noqa: F401
 from torch_spyre._C import DataFormats, get_device_dtype
@@ -900,7 +900,7 @@ def spyre_quantize_fp8_with_scale(
 ) -> torch.Tensor:
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, -448.0, 448.0)
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 
@@ -910,8 +910,9 @@ def spyre_quantize_weight_fp8_with_scale(
 ) -> torch.Tensor:
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, -448.0, 448.0)
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
     return torch.ops.spyre.qfp8wt(x_clamped)
+
 
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##

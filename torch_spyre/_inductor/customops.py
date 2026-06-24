@@ -558,6 +558,7 @@ def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
 
+
 @torch.library.custom_op("spyre::qfp8ch", mutates_args=(), device_types="spyre")
 def qfp8ch(input: torch.Tensor) -> torch.Tensor:
     """

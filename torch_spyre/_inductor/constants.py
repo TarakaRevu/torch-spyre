@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
@@ -86,7 +88,9 @@ SPYRE_FP32_OPS = [
 ]
 
 # FP8 E4M3 numeric limits
-FP8_E4M3_MAX = 448.0
+FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
+FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
+FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
 
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {

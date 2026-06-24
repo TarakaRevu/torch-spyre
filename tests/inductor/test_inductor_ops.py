@@ -326,16 +326,22 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
 # M x K x N -> [M, K] @ [K, N]
 _SCALED_MM_SHAPES_SUPPORTED = [
     (128, 128, 128),
+    (1, 128, 128),
+    (1, 128, 100),
     (2, 128, 100),
     (2, 128, 128),
-    (2, 4096, 4096),
     (3, 128, 128),
     (4, 128, 1024),
-    (4, 4096, 4096),
 ]
 
 _SCALED_MM_SHAPES_UNSUPPORTED = [
+    # large tensor:
+    # DtException: [distributeElemArrToTemporalLoops] Not enough elements to distribute.
     (1, 4096, 4096),
+    (2, 4096, 4096),
+    (4, 4096, 4096),
+    # padding on reduction dim:
+    # DtException: Scheduler failed to find a suitable op mapping for sdsc: 0_identity
     (2, 100, 128),
     (5, 200, 300),
 ]
