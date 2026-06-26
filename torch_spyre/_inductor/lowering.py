@@ -253,7 +253,7 @@ def eager_fallback(op, *args, **kwargs):
 
 
 # TODO:This is just place holder now; Real implementation will follow
-@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+@register_spyre_lowering(torch.ops.aten._scaled_mm.default, type_promotion_kind=None)
 def lower_scaled_mm(
     mat1,
     mat2,
@@ -340,6 +340,29 @@ def lower_scaled_mm(
     )
 
     result.realize()
+
+    # Apply activation scale
+    if scale_a is not None:
+        scale_a.realize()
+        result = lowering.mul(result, scale_a)
+        result.realize()
+
+    # Apply weight scale
+    if scale_b is not None:
+        scale_b.realize()
+        result = lowering.mul(result, scale_b)
+        result.realize()
+
+    # Apply bias
+    if bias is not None:
+        bias.realize()
+        result = lowering.add(result, bias)
+        result.realize()
+
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
 
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())

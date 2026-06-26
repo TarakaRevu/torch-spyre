@@ -350,7 +350,12 @@ _SCALED_MM_SHAPES = _SCALED_MM_SHAPES_SUPPORTED + _SCALED_MM_SHAPES_UNSUPPORTED
 
 # scale_a, scale_b, bias
 _SCALED_MM_PARAMS = [
-    (1.0, 1.0, 0.0),
+    (1.0, 1.0, 0.0),   # unit scales, no bias — baseline
+    (2.0, 1.0, 0.0),   # non-unit scale_a
+    (1.0, 3.0, 0.0),   # non-unit scale_b
+    (2.0, 3.0, 0.0),   # both non-unit scales
+    (1.0, 1.0, 5.0),   # unit scales with bias
+    (2.0, 3.0, 0.5),   # non-unit scales with bias
 ]
 
 SCALED_MM_TESTS = {
