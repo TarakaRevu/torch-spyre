@@ -253,7 +253,7 @@ def eager_fallback(op, *args, **kwargs):
 
 
 # TODO:This is just place holder now; Real implementation will follow
-@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+@register_spyre_lowering(torch.ops.aten._scaled_mm.default, type_promotion_kind=None)
 def lower_scaled_mm(
     mat1,
     mat2,

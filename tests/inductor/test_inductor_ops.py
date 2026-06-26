@@ -322,6 +322,58 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+# M x K x N -> [M, K] @ [K, N]
+_SCALED_MM_SHAPES_SUPPORTED = [
+    (128, 128, 128),
+    (1, 128, 128),
+    (1, 128, 100),
+    (2, 128, 100),
+    (2, 128, 128),
+    (3, 128, 128),
+    (4, 128, 1024),
+]
+
+_SCALED_MM_SHAPES_UNSUPPORTED = [
+    # large tensor:
+    # DtException: [distributeElemArrToTemporalLoops] Not enough elements to distribute.
+    (1, 4096, 4096),
+    (2, 4096, 4096),
+    (4, 4096, 4096),
+    # padding on reduction dim:
+    # DtException: Scheduler failed to find a suitable op mapping for sdsc: 0_identity
+    (2, 100, 128),
+    (5, 200, 300),
+]
+
+_SCALED_MM_SHAPES = _SCALED_MM_SHAPES_SUPPORTED + _SCALED_MM_SHAPES_UNSUPPORTED
+
+# scale_a, scale_b, bias
+_SCALED_MM_PARAMS = [
+    (1.0, 1.0, 0.0),   # unit scales, no bias — baseline
+    (2.0, 1.0, 0.0),   # non-unit scale_a
+    (1.0, 3.0, 0.0),   # non-unit scale_b
+    (2.0, 3.0, 0.0),   # both non-unit scales
+    (1.0, 1.0, 5.0),   # unit scales with bias
+    (2.0, 3.0, 0.5),   # non-unit scales with bias
+]
+
+SCALED_MM_TESTS = {
+    f"{shapes2key([shape])}_{sa}_{sb}_{b}": (
+        torch.rand((shape[0], shape[1]), dtype=torch.float16),
+        torch.rand((shape[1], shape[2]), dtype=torch.float16),
+        torch.tensor(sa, dtype=torch.float16),
+        torch.tensor(sb, dtype=torch.float16),
+        torch.tensor(b, dtype=torch.float16),
+    )
+    for shape in _SCALED_MM_SHAPES
+    for sa, sb, b in _SCALED_MM_PARAMS
+}
+
+SCALED_MM_TESTS_EXPECT_FAIL = [
+    f"{shapes2key([shape])}_{sa}_{sb}_{b}"
+    for shape in _SCALED_MM_SHAPES_UNSUPPORTED
+    for sa, sb, b in _SCALED_MM_PARAMS
+]
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
