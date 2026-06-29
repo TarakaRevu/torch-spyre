@@ -279,11 +279,7 @@ def _get_qfp8wt_split_constraints(
     input_tds: list[TensorDep],
     output_td: TensorDep,
 ) -> dict[Symbol, int]:
-    """Return split constraints (=1) for QFP8WT second stick dimension.
-
-    For QFP8WT tensors with 2D stick layouts, prevent splitting the second
-    stick dimension across cores to maintain 128-byte alignment.
-    """
+    """Return split constraints (=1) for QFP8WT second stick dimension."""
     constraints: dict[Symbol, int] = {}
     if not _has_qfp8wt_tensor(input_tds + [output_td]):
         return constraints
@@ -894,6 +890,11 @@ def _default_split(
     it_space_remaining = {
         s: e for s, e in it_space_adjusted.items() if s not in committed_splits
     }
+    if len(output_td.device_coords) >= 2 and _is_qfp8wt_tensor(output_td):
+        stick_coord_vars = set(output_td.device_coords[-2].free_symbols)
+        it_space_remaining = {
+            s: e for s, e in it_space_remaining.items() if s not in stick_coord_vars
+        }
     output_dims, reduction_dims = prioritize_dimensions(
         output_td, it_space_remaining, symbol_meta
     )
