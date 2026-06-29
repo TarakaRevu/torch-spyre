@@ -324,29 +324,16 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
 ]
 
 # M x K x N -> [M, K] @ [K, N]
-_SCALED_MM_SHAPES_SUPPORTED = [
+_SCALED_MM_SHAPES = [
     (128, 128, 128),
     (1, 128, 128),
-    (1, 128, 100),
-    (2, 128, 100),
     (2, 128, 128),
     (3, 128, 128),
     (4, 128, 1024),
-]
-
-_SCALED_MM_SHAPES_UNSUPPORTED = [
-    # large tensor:
-    # DtException: [distributeElemArrToTemporalLoops] Not enough elements to distribute.
     (1, 4096, 4096),
     (2, 4096, 4096),
     (4, 4096, 4096),
-    # padding on reduction dim:
-    # DtException: Scheduler failed to find a suitable op mapping for sdsc: 0_identity
-    (2, 100, 128),
-    (5, 200, 300),
 ]
-
-_SCALED_MM_SHAPES = _SCALED_MM_SHAPES_SUPPORTED + _SCALED_MM_SHAPES_UNSUPPORTED
 
 # scale_a, scale_b, bias
 _SCALED_MM_PARAMS = [
@@ -365,11 +352,6 @@ SCALED_MM_TESTS = {
     for sa, sb, b in _SCALED_MM_PARAMS
 }
 
-SCALED_MM_TESTS_EXPECT_FAIL = [
-    f"{shapes2key([shape])}_{sa}_{sb}_{b}"
-    for shape in _SCALED_MM_SHAPES_UNSUPPORTED
-    for sa, sb, b in _SCALED_MM_PARAMS
-]
 
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
@@ -4388,7 +4370,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
             "param_sets": SCALED_MM_TESTS,
-            "expect_fail": SCALED_MM_TESTS_EXPECT_FAIL,
         },
         (
             "test_multiops_split",
@@ -6129,9 +6110,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
         def pytorch_fn(a, b, scale_a, scale_b, bias=None):
-            q_a = (a / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            q_b = (b / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            return (q_a @ q_b).to(torch.float16) * (scale_a * scale_b) + bias
+            q_a = (
+                (a / scale_a)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            q_b = (
+                (b / scale_b)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            return (q_a @ q_b) * (scale_a * scale_b) + bias
 
         compare_with_pytorch(
             spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
