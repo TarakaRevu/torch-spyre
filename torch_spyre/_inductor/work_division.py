@@ -39,7 +39,7 @@ from .constants import BATCH_MATMUL_OP, TOPK_OPS, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
-    _finite_upper_or_none,
+    finite_upper_or_none,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -99,7 +99,7 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     for sym, expr in it_space.items():
         if not (hasattr(expr, "free_symbols") and expr.free_symbols):
             continue
-        if _finite_upper_or_none(expr) is None:
+        if finite_upper_or_none(expr) is None:
             logger.debug(
                 f"[work_division/symbolic] skipping auto-dynamic symbol "
                 f"{sym}; use mark_dynamic(max=...) to enable symbolic planning"
