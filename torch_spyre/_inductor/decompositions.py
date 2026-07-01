@@ -897,6 +897,10 @@ def where_scalar_decomp(condition, self, other):
 def spyre_quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
+    # Fix  mark M as static so Dynamo installs a strict equality
+    # guard on shape[0]. The AIU binary hard-codes the loop bound at compile
+    # time, so a shape change must trigger a recompile.
+    torch._dynamo.mark_static(input, 0)
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
     x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)

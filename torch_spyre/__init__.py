@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+import shutil
 import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
@@ -326,6 +327,24 @@ def _autoload():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+
+    # Fix  hook dynamo.reset() to also wipe the on-disk
+    # dxp_standalone binary cache. Python-level reset() only clears Dynamo's
+    # guard cache and Inductor's in-memory kernel map; the AIU binaries under
+    # cache_dir()/inductor-spyre/ persist and can be re-loaded for the wrong
+    # shape, silently producing zero rows in quantize_fp8_with_scale output.
+    def _clear_spyre_binary_cache():
+        from torch._inductor.runtime.runtime_utils import cache_dir as _cache_dir
+        spyre_cache = os.path.join(_cache_dir(), "inductor-spyre")
+        if os.path.isdir(spyre_cache):
+            try:
+                shutil.rmtree(spyre_cache)
+            except OSError:
+                pass  # best-effort; never raise inside a reset hook
+
+    _register_hook = getattr(torch._dynamo, "register_on_cache_clear", None)
+    if _register_hook is not None:
+        _register_hook(_clear_spyre_binary_cache)
 
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 

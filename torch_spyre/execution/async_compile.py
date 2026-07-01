@@ -20,6 +20,7 @@ import subprocess
 import torch
 
 from torch._inductor.runtime.runtime_utils import cache_dir
+import hashlib
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -40,6 +41,21 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
+def get_output_dir_for_shape(kernel_name: str, specs) -> str:
+    """Like get_output_dir() but encodes op shapes in the directory name.
+
+    Fix  each unique (kernel_name, shapes) combination gets its
+    own dxp_standalone binary. Two calls with the same kernel but different
+    M (e.g. M=2 vs M=3) land in distinct directories and are compiled
+    independently, preventing the stale-kernel reuse that left extra rows zero.
+    """
+    spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
+    os.makedirs(spyre_dir, exist_ok=True)
+    shape_tag = hashlib.sha256(repr(specs).encode()).hexdigest()[:16]
+    prefix = f"{kernel_name}_{shape_tag}_"
+    return tempfile.mkdtemp(dir=spyre_dir, prefix=prefix)
+
+
 class SpyreAsyncCompile:
     def __init__(self) -> None:
         pass
@@ -54,8 +70,9 @@ class SpyreAsyncCompile:
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
+        # Fix 2/3 (#2523): use shape-aware dir so each (kernel, shape)
+        # combination gets its own dxp_standalone binary.
+        output_dir = get_output_dir_for_shape(kernel_name, specs)
         generate_bundle(kernel_name, output_dir, specs)
 
         # Invoke backend compiler of SDSC Bundle
