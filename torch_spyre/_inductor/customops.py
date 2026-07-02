@@ -643,15 +643,15 @@ def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch
         - Scale must be FP16, NOT FP32
     """
     pass
-
-
+  
+  
 @dequantize_fp8_with_scale.register_fake
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP16 with same shape as input
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
 
 
-@torch.library.custom_op(
+ @torch.library.custom_op(
     "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
 def quantize_weight_fp8_with_scale(
@@ -675,3 +675,20 @@ def qfp8wt(input: torch.Tensor) -> torch.Tensor:
 def _(input: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+ 
+@torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
+def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
+    pass
+
+
+@prod_dim_int.register_fake
+def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
+    if dim < 0:
+        dim += input.ndim
+    out_shape = list(input.shape)
+    if keepdim:
+        out_shape[dim] = 1
+    else:
+        out_shape = out_shape[:dim] + out_shape[dim + 1 :]
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
