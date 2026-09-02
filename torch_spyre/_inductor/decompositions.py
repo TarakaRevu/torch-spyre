@@ -382,6 +382,46 @@ def spyre_linear(
         out = out + bias
     return out
 
+@register_spyre_decompositions([torch.ops.aten.mm.default])
+def spyre_mm_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """FP32 mm via FP16 on-device cast (issue #1794).
+
+    Spyre's batchmatmul op does not yet support IEEE_FP32 inputs —
+    ``create_op_spec`` raises ``Unsupported: batchmatmul on DataFormats.IEEE_FP32``.
+    Until ``batchmatmul`` is added to ``SPYRE_FP32_OPS``, cast FP32 operands
+    down to FP16, run the matmul on-device, and cast the result back to FP32.
+
+    This affects cross-encoder rerankers (RobertaClassificationHead, two dense
+    layers in FP32) and token-classification heads (e.g. dslim/bert-base-NER)
+    whose classifier runs after a head_dtype=float32 cast.  MEAN pooling is
+    unrelated (blocked by index_add_, issue #3507).
+
+    Non-FP32 inputs fall through to the mm lowering unchanged (returns
+    ``NotImplemented`` so Inductor uses its own lowering).
+    """
+    if x.dtype != torch.float32 or y.dtype != torch.float32:
+        return NotImplemented
+    out_fp16 = torch.ops.aten.mm.default(x.to(torch.float16), y.to(torch.float16))
+    return out_fp16.to(torch.float32)
+
+
+@register_spyre_decompositions([torch.ops.aten.bmm.default])
+def spyre_bmm_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """FP32 bmm via FP16 on-device cast (issue #1794).
+
+    Same rationale as ``spyre_mm_fp32``.  ``aten.linear`` (and therefore any
+    FP32 nn.Linear / F.linear call) lowers via ``mm_to_bmm_pass`` to
+    ``aten.bmm``.  This decomposition intercepts that case before the lowering
+    sees the IEEE_FP32 dtype.
+
+    Non-FP32 inputs fall through (returns ``NotImplemented``).
+    """
+    if x.dtype != torch.float32 or y.dtype != torch.float32:
+        return NotImplemented
+    out_fp16 = torch.ops.aten.bmm.default(x.to(torch.float16), y.to(torch.float16))
+    return out_fp16.to(torch.float32)
+
+
 
 @register_spyre_decompositions(
     [torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default]
@@ -504,22 +544,22 @@ def spyre__sdpa_overrideable(
                             M - max_running
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-                        denominator = torch.ops.spyre.opaque_copy_(
+                        denominator = torch.ops.spyre.copy_forced(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # batch_size, num_heads, max_seqlen_q sparse
-                        output = torch.ops.spyre.opaque_copy_(
+                        output = torch.ops.spyre.copy_forced(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, value),
                             output,
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
-                        M = torch.ops.spyre.opaque_copy_(
+                        M = torch.ops.spyre.copy_forced(
                             max_running,
                             M,
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-    output = torch.ops.spyre.opaque_copy_(output / denominator.unsqueeze(-1), output)
+    output = torch.ops.spyre.copy_forced(output / denominator.unsqueeze(-1), output)
     # The reference meta kernel for this op
     # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
     # overrideable -> alloc_with_matching_layout) declares the output layout to
@@ -1160,6 +1200,26 @@ def spyre_prod_dim_int(
     return acc
 
 
+@register_spyre_decompositions(
+    [torch.ops.aten.all.default, torch.ops.aten.all.dim, torch.ops.aten.all.dims]
+)
+def spyre_all(
+    input: torch.Tensor,
+    dim=None,
+    keepdim: bool = False,
+) -> torch.Tensor:
+    # Convert bool to float16 if needed
+    if input.dtype is torch.bool:
+        tmp = input.to(torch.float16)
+    else:
+        tmp = input
+
+    tmp = torch.abs(tmp)
+    result = torch.amin(tmp, dim=dim, keepdim=keepdim)
+
+    return result.to(torch.bool)
+
+
 def _masked_scatter_reject_reason(
     self: torch.Tensor,
     mask: torch.Tensor,
@@ -1300,3 +1360,4 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
