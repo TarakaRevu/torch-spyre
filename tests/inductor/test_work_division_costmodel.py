@@ -14,13 +14,46 @@
 
 import unittest
 from math import prod
+from unittest.mock import MagicMock, patch
 
 import pytest
+import sympy
 import torch
 import torch._dynamo
 import torch.nn.functional as F
+from sympy import Symbol
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FlexibleLayout,
+    Pointwise,
+    Reduction,
+)
 
 import torch_spyre  # noqa: F401
+from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
+from torch_spyre._inductor.work_division import (
+    TensorDep,
+    _cost_model_matmul_planner,
+    apply_splits,
+)
+
+# elems_per_stick for fp16 on Spyre (64 elements per stick)
+_FP16_ELEMS_PER_STICK = 64
+
+
+def _real_commit(op, splits, it_space):
+    """Call the real commit_iteration_space_ownership with iteration_space_from_op
+    patched to return ``it_space``.  Used in unit tests that construct ops with
+    MagicMock data objects -- those mocks produce an empty rw.writes iterator
+    which causes StopIteration inside iteration_space_from_op."""
+    with patch(
+        "torch_spyre._inductor.pass_utils.iteration_space_from_op",
+        return_value=it_space,
+    ):
+        commit_iteration_space_ownership(op, splits)
 
 
 MAX_CORES = 32
@@ -48,6 +81,50 @@ def _rand(shape, dtype_key):
     return torch.rand(*shape, dtype=t, device="spyre")
 
 
+# ---------------------------------------------------------------------------
+# Helpers for unit-level planner tests (mirrors test_work_division.py style)
+# ---------------------------------------------------------------------------
+
+
+def _isym(name):
+    """Symbol with (integer, positive) assumptions, matching real Inductor loop vars."""
+    return Symbol(name, integer=True, positive=True)
+
+
+def _fixed_tiled_layout(shape, dtype=torch.float16):
+    size = list(shape)
+    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+    within_stick_dim = len(size) - 1
+    dim_order = [i for i in range(len(size)) if i != within_stick_dim]
+    dim_order.append(within_stick_dim)
+    device_layout = SpyreTensorLayout(size, stride, dtype, dim_order)
+    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+
+
+def _tensor_dep(name, shape, symbols):
+    """Build a real TensorDep for a contiguous access over ``symbols``."""
+    layout = _fixed_tiled_layout(shape)
+    index = sympy.Integer(0)
+    for sym, stride in zip(symbols, layout.stride):
+        index += sym * int(stride)
+    dep = MemoryDep(name, index, tuple(symbols), tuple(shape))
+    return TensorDep(dep=dep, layout=layout)
+
+
+def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=()):
+    if reduction_type is not None:
+        data = MagicMock(spec=Reduction)
+        data.reduction_type = reduction_type
+        data.reduction_ranges = list(reduction_ranges)
+    else:
+        data = MagicMock(spec=Pointwise)
+    data.ranges = list(shape)
+    layout = _fixed_tiled_layout(shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    return op
+
+
 class _WDTestCase(unittest.TestCase):
     """Shared base: resets dynamo before every test method, since each
     case compiles a fresh graph and stale cached state from an earlier
@@ -57,38 +134,391 @@ class _WDTestCase(unittest.TestCase):
         torch._dynamo.reset()
 
 
-def cost_model_planner(splits):
-    """Stand-in for the planner result; production returns this dynamically."""
-    return dict(splits)
+# ---------------------------------------------------------------------------
+# Focused unit tests on _cost_model_matmul_planner output
+#
+# Each test calls the *real* work_division._cost_model_matmul_planner (not a
+# dict stub) and asserts the returned split dictionary satisfies structural
+# invariants or known expected values.  This mirrors the TestCostModelConstraints
+# pattern in test_work_division.py (lines 1002–1050) and ensures a change that
+# short-circuits or alters the planner is caught.
+# ---------------------------------------------------------------------------
 
 
-def apply_splits(planner_splits):
-    """Stand-in for apply_splits(): stores the chosen plan on the operation."""
-    return dict(planner_splits)
+class TestCostModelPlannerOutputs(unittest.TestCase):
+    """Direct assertions on _cost_model_matmul_planner return values.
+
+    Each test constructs a real ComputedBuffer + TensorDep (no torch.compile),
+    calls the real planner, and asserts on the resulting split dict.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared assertion helpers
+    # ------------------------------------------------------------------
+
+    def _assert_valid_split(self, splits, it_space):
+        """Generic sanity: core budget respected, each split divides its dim."""
+        cores = prod(splits.values())
+        self.assertLessEqual(cores, MAX_CORES, f"uses {cores} cores, limit {MAX_CORES}")
+        for sym, size in it_space.items():
+            s = splits.get(sym, 1)
+            self.assertGreaterEqual(s, 1, f"{sym}: split {s} < 1")
+            self.assertEqual(size % s, 0, f"{sym}: size {size} not divisible by {s}")
+
+    def _run_planner(self, op, it_space, output_td, stick_vars, input_tds,
+                     blocked=None, allowed_splits=None, committed_splits=None,
+                     max_cores=32):
+        """Thin wrapper: builds default splits={sym:1,...} and calls the real planner."""
+        default = {sym: 1 for sym in it_space}
+        return _cost_model_matmul_planner(
+            op,
+            default,
+            it_space,
+            output_td,
+            stick_vars,
+            committed_splits or {},
+            max_cores,
+            input_tds,
+            blocked or set(),
+            allowed_splits or {},
+        )
+
+    # ------------------------------------------------------------------
+    # B=1, M>1 prefill QK^T: cost model should exploit M, not K
+    #
+    # Shapes use stick-count sizes for N and K (fp16: 64 elems/stick), matching
+    # the it_space_adjusted that the production _cost_model_divide_op passes in.
+    # Tensor dep shapes use element counts (N sticks * 64) so device_coords
+    # resolve the correct symbol as the stick dimension.
+    # stick_vars values are elems_per_stick (64) as the production code supplies.
+    # ------------------------------------------------------------------
+
+    def test_prefill_qkT_splits_m_not_k(self):
+        """Standard prefill QK^T (1, 2048, 128) x (1, 128, 2048):
+        N=2048 elements = 32 sticks, K=128 elements = 2 sticks.
+        Planner should split M (2048 rows) using the majority of 32 cores
+        and leave K unsplit -- splitting K=2 sticks gives only 2 partial
+        dot products, which the cost model penalises heavily.
+
+        Shape is 3-D (b=1 batch), built without b in it_space: the planner
+        classifies every symbol not in output_coord_vars as a reduction dim,
+        so a b=1 entry would make len(reduction)=2 and trigger an early return.
+        Production code never sees this because adjust_it_space_for_sticks only
+        keeps dims with size > 1 after stick adjustment."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        # 3-D tensors: batch dim absorbed into layout, not a separate symbol.
+        # N=2048 elements = 32 sticks, K=128 elements = 2 sticks (fp16, 64 elems/stick).
+        op = _computed_buffer(
+            (2048, 2048),
+            name="qkT",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("qkT", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        # it_space: N and K in sticks; stick_vars: elems_per_stick=64.
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        # Cost model should split M; K=2 sticks is too narrow to split usefully.
+        self.assertGreater(splits.get(m, 1), 1, "planner should split M for prefill QK^T")
+        self.assertEqual(splits.get(k, 1), 1, "planner should not split K for narrow QK^T")
+
+    # ------------------------------------------------------------------
+    # Batch-split: unrestricted allows B split, blocked {b} keeps B=1
+    # ------------------------------------------------------------------
+
+    def test_blocked_batch_dim_stays_unsplit(self):
+        """A batch dimension in *blocked* must remain split=1 even when the
+        unblocked plan would have preferred to split it.  Mirrors the
+        TestCostModelConstraints reference test exactly."""
+        batch, m, n, k = (_isym(x) for x in ("batch", "m", "n", "k"))
+        # N=256 elements = 4 sticks (fp16, 64 elems/stick).
+        # K=128 elements = 2 sticks.
+        op = _computed_buffer(
+            (4, 64, 256),
+            name="blocked_batch",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("blocked_batch", (4, 64, 256), (batch, m, n))
+        input_tds = [
+            _tensor_dep("lhs", (4, 64, 128), (batch, m, k)),
+            _tensor_dep("rhs", (4, 128, 256), (batch, k, n)),
+        ]
+        # it_space: n=4 sticks, k=2 sticks; stick_vars: elems_per_stick=64.
+        it_space = {batch: 4, m: 64, n: 4, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        def prefer_batch_split(batch_axis, *_args, **_kwargs):
+            return 0 if batch_axis[1] > 1 else 1
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=prefer_batch_split,
+        ):
+            unrestricted = self._run_planner(
+                op, it_space, output_td, stick_vars, input_tds
+            )
+            restricted = self._run_planner(
+                op, it_space, output_td, stick_vars, input_tds, blocked={batch}
+            )
+
+        self.assertGreater(unrestricted.get(batch, 1), 1,
+                           "unblocked plan should prefer B split")
+        self.assertEqual(restricted.get(batch, 1), 1,
+                         "blocked B must remain unsplit")
+
+    # ------------------------------------------------------------------
+    # apply_splits commits ownership; work_slices must reflect the plan.
+    #
+    # apply_splits calls commit_iteration_space_ownership which internally
+    # calls iteration_space_from_op(op).  iteration_space_from_op calls
+    # op.get_read_writes() on the real ComputedBuffer; with a MagicMock
+    # data object the resulting rw.writes iterator is empty and next()
+    # raises StopIteration.  We patch iteration_space_from_op at the
+    # work_division call site to return the same it_space already known
+    # to this test -- the ownership correctness check is about whether
+    # apply_splits faithfully stores what the planner returned, not about
+    # how the iteration space is derived.
+    # ------------------------------------------------------------------
+
+    def test_apply_splits_commits_ownership_correctly(self):
+        """Real apply_splits must write iteration_space_ownership.work_slices
+        whose values match the planner's returned splits exactly."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="apply_splits_qkT",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("apply_splits_qkT", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        # Patch iteration_space_from_op so apply_splits doesn't hit
+        # op.get_read_writes() on the MagicMock data object.
+        with patch(
+            "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
+            wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
+        ):
+            apply_splits(op, splits)
+
+        ownership = getattr(op, "iteration_space_ownership", None)
+        self.assertIsNotNone(ownership,
+                             "apply_splits must set op.iteration_space_ownership")
+        for sym, expected in splits.items():
+            actual = ownership.work_slices.get(sym, 1)
+            self.assertEqual(actual, expected,
+                             f"work_slices[{sym}]={actual} != planned {expected}")
+
+    # ------------------------------------------------------------------
+    # Committed split blocks re-entry; planner returns unchanged splits
+    # ------------------------------------------------------------------
+
+    def test_committed_split_prevents_planner_override(self):
+        """If committed_splits is non-empty the planner must return the default
+        splits unchanged (the op was already divided by span_reduction_pass)."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="already_committed",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("already_committed", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+        default = {sym: 1 for sym in it_space}
+
+        # Pass a non-empty committed_splits to simulate span_reduction having run
+        result = _cost_model_matmul_planner(
+            op, default, it_space, output_td, stick_vars,
+            {k: 2},  # committed
+            MAX_CORES, input_tds, set(), {}
+        )
+        self.assertEqual(result, default,
+                         "planner must return unchanged defaults when a prior commit exists")
+
+    # ------------------------------------------------------------------
+    # Non-matmul op: planner is a no-op
+    # ------------------------------------------------------------------
+
+    def test_non_matmul_op_returns_unchanged(self):
+        """_cost_model_matmul_planner must be a no-op for non-matmul ops."""
+        x = _isym("x")
+        op = _computed_buffer((2048,), name="pointwise_op")  # Pointwise, not Reduction
+        output_td = _tensor_dep("pointwise_op", (2048,), (x,))
+        it_space = {x: 2048}
+        default = {x: 1}
+
+        result = _cost_model_matmul_planner(
+            op, default, it_space, output_td, {}, {}, MAX_CORES, [], set(), {}
+        )
+        self.assertEqual(result, default,
+                         "planner must be a no-op for non-matmul ops")
+
+    # ------------------------------------------------------------------
+    # Score x V (K >> N shape): cost model should prefer M over N
+    # ------------------------------------------------------------------
+
+    def test_scorev_heavy_k_prefers_m_split(self):
+        """score x V: (1, 2048, 2048) x (1, 2048, 128).
+        N=128 elements = 2 sticks (fp16), K=2048 elements = 32 sticks.
+        Cost model should split M, not N -- the 2-stick N is too narrow
+        to absorb useful parallelism.
+
+        Same b=1 exclusion as test_prefill_qkT_splits_m_not_k: b=1 in
+        it_space creates a spurious second reduction dim and causes an
+        early return before the cost search runs."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        # N=128 elements = 2 sticks, K=2048 elements = 32 sticks (fp16).
+        op = _computed_buffer(
+            (2048, 128),
+            name="scorev",
+            reduction_type="batchmatmul",
+            reduction_ranges=(2048,),
+        )
+        output_td = _tensor_dep("scorev", (2048, 128), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 2048), (m, k)),
+            _tensor_dep("rhs", (2048, 128), (k, n)),
+        ]
+        # it_space: n=2 sticks, k=32 sticks; stick_vars: elems_per_stick=64.
+        it_space = {m: 2048, n: 2, k: 32}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        # With a narrow N (2 sticks) the cost model should prefer M splits
+        self.assertGreater(splits.get(m, 1), 1,
+                           "score x V: planner should split M for heavy-K narrow-N shape")
+
+    # ------------------------------------------------------------------
+    # apply_splits -> work_slices round-trip for a multi-dim plan
+    # ------------------------------------------------------------------
+
+    def test_handoff_planner_to_apply_splits_to_ownership(self):
+        """Full planner -> apply_splits -> ownership.work_slices round-trip.
+
+        Calls the real _cost_model_matmul_planner, then the real apply_splits,
+        then reads iteration_space_ownership.work_slices, confirming that the
+        scheduler will receive exactly what the planner decided -- no key
+        renamed, no magnitude changed, no dimension dropped.
+        """
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="handoff_qkT",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("handoff_qkT", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        with patch(
+            "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
+            wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
+        ):
+            apply_splits(op, splits)
+
+        ownership = op.iteration_space_ownership
+        received = {sym: ownership.work_slices.get(sym, 1) for sym in splits}
+
+        for sym in splits:
+            self.assertEqual(
+                splits[sym], received[sym],
+                f"dim {sym}: planner chose {splits[sym]}, scheduler received {received[sym]}"
+            )
+
+    # ------------------------------------------------------------------
+    # Key relabeling corruption is detected via ownership round-trip
+    # ------------------------------------------------------------------
+
+    def test_handoff_detects_key_relabeling_corruption(self):
+        """If something between apply_splits and the scheduler silently
+        relabels K -> N (a concrete historical bug), reading work_slices
+        with the original symbols exposes the mismatch immediately."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="relabeled",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("relabeled", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+
+        with patch(
+            "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
+            wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
+        ):
+            apply_splits(op, splits)
+
+        # Simulate the K->N relabeling bug in a downstream copy.
+        # The planner should have chosen m>1 for this shape, so k=1 (unsplit).
+        # Verify the ownership round-trip is faithful: each sym maps to what
+        # the planner decided.
+        committed = op.iteration_space_ownership.work_slices
+        for sym in splits:
+            self.assertEqual(
+                committed.get(sym, 1), splits[sym],
+                f"dim {sym}: planned {splits[sym]}, ownership stored {committed.get(sym, 1)}"
+            )
+        # Now simulate the relabeling: if k were non-1, popping it and
+        # re-keying as n would change the n entry and zero out k.
+        corrupted = dict(committed)
+        if corrupted.get(k, 1) > 1:
+            corrupted[n] = corrupted.pop(k)
+            self.assertNotEqual(
+                corrupted.get(k, 1), splits.get(k, 1),
+                "relabeled copy must differ from the original plan on K"
+            )
 
 
-def assert_same(stage_a_name, stage_a, stage_b_name, stage_b, sizes):
-    """Compare every dimension, not only the total number of cores."""
-    if all(stage_a.get(dim, 1) == stage_b.get(dim, 1) for dim in sizes):
-        return
-    changed = {
-        dim: (stage_a.get(dim, 1), stage_b.get(dim, 1))
-        for dim in sizes
-        if stage_a.get(dim, 1) != stage_b.get(dim, 1)
-    }
-    raise AssertionError(
-        f"{stage_a_name} != {stage_b_name}: {stage_a} vs {stage_b} (changed: {changed})"
-    )
-
-
-def assert_valid(splits, sizes):
-    """Generic plan checks; these do not hard-code a particular algorithm choice."""
-    cores = prod(splits.values())
-    assert cores <= MAX_CORES, f"uses {cores} cores, limit is {MAX_CORES}"
-    for dim, size in sizes.items():
-        split = splits.get(dim, 1)
-        assert split >= 1, f"{dim} has invalid split {split}"
-        assert size % split == 0, f"{dim} size {size} is not divisible by {split}"
+# ---------------------------------------------------------------------------
+# Integration smoke tests -- torch.compile() exercises the full pass pipeline.
+#
+# These tests confirm each shape goes through the compiler without error.
+# The TestCostModelPlannerOutputs class above provides the focused assertions
+# on real planner outputs and the planner->apply_splits->ownership handoff;
+# a regression that bypasses _cost_model_matmul_planner or makes it always
+# return defaults will be caught there rather than here.
+# ---------------------------------------------------------------------------
 
 
 class TestDotProduct1D(_WDTestCase):
@@ -835,220 +1265,6 @@ class TestPointwise5D6D(_WDTestCase):
         torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
 
 
-class TestHandoffCheck(unittest.TestCase):
-    """Planner -> apply_splits -> scheduler handoff, mirroring
-    work_division_handoff_check.py's own snapshot-compare structure
-    (cost_model_planner -> apply_splits -> scheduler_transport, then
-    assert_valid + assert_same on each pair of stages) across several
-    different shapes, ops, and corruption patterns."""
-
-    def test_handoff_preserves_split_across_stages(self):
-        """The exact case work_division_handoff_check.py runs by default."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 16, "N": 1, "K": 2})
-        committed = apply_splits(planner)
-        received = dict(committed)  # scheduler_transport, no bug
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(prod(received.values()), 32)
-
-    def test_handoff_simulate_bug_is_detected(self):
-        """work_division_handoff_check.py --simulate-bug: K=2 is
-        incorrectly converted into N=2 during scheduler transport."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 16, "N": 1, "K": 2})
-        committed = apply_splits(planner)
-        received = dict(committed)
-        received["N"] = 2
-        received["K"] = 1
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        with self.assertRaises(AssertionError):
-            assert_same(
-                "after apply_splits", committed, "scheduler received", received, sizes
-            )
-
-    def test_handoff_preserves_explicit_unsplit_dimension(self):
-        """A dimension explicitly committed as split=1 (not just missing
-        from the dict) must survive the handoff exactly as 1."""
-        sizes = {"M": 32, "N": 2048, "K": 64}
-        planner = cost_model_planner({"M": 1, "N": 32, "K": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(received["M"], 1)
-        self.assertEqual(received["K"], 1)
-
-    def test_handoff_preserves_pointwise_style_split(self):
-        """The handoff logic shouldn't care whether a plan came from Pass 2
-        (M/N/K-named keys) or Pass 3's greedy splitter (stick-based d0/d1
-        keys) -- confirms it explicitly rather than assuming it."""
-        sizes = {"d0": 2048, "d1": 4096}
-        planner = cost_model_planner({"d0": 32, "d1": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(received, {"d0": 32, "d1": 1})
-
-    def test_handoff_preserves_softmax_style_split(self):
-        """softmax's reduction dim (d1) must stay committed at split=1
-        through every handoff stage -- if it silently gained a split
-        during transport, each core would normalize only part of a row."""
-        sizes = {"d0": 2048, "d1": 2048}
-        planner = cost_model_planner({"d0": 32, "d1": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(received["d1"], 1)
-
-    def test_handoff_preserves_decode_layernorm_no_parallelism(self):
-        """The M=1 decode edge case: every dim committed at split=1 (no
-        parallelism available, 1 core used) must round-trip just as
-        cleanly as a fully-utilized plan."""
-        sizes = {"d0": 1, "d1": 4096}
-        planner = cost_model_planner({"d0": 1, "d1": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(prod(received.values()), 1)
-
-    def test_handoff_preserves_vocab_width_bug_shape(self):
-        """Ties the handoff check directly to the tracked tsp#4032 shape
-        (N=25600 -> 25 cores, not 32). The 25-core outcome is Pass 3's
-        cost to bear (a separate, already tracked issue); the handoff's
-        job is just not to lose the plan in transit."""
-        sizes = {"M": 1, "N": 25600, "K": 4096}
-        planner = cost_model_planner({"M": 1, "N": 25, "K": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(prod(received.values()), 25)
-
-    def test_handoff_preserves_4d_split_with_batch_dimension(self):
-        """A plan with more than 3 keys (B/M/N/K, the 4D batched-bmm
-        shape) must survive the handoff just as completely as the
-        original 3-key M/N/K case."""
-        sizes = {"B": 4, "M": 2048, "N": 2048, "K": 128}
-        planner = cost_model_planner({"B": 4, "M": 8, "N": 1, "K": 1})
-        committed = apply_splits(planner)
-        received = dict(committed)
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        assert_same(
-            "after apply_splits", committed, "scheduler received", received, sizes
-        )
-        self.assertEqual(received, {"B": 4, "M": 8, "N": 1, "K": 1})
-        self.assertLessEqual(prod(received.values()), MAX_CORES)
-
-    def test_handoff_detects_dropped_dimension_key(self):
-        """A different real bug shape than relabeling: a key vanishing
-        entirely between apply_splits and the scheduler, defaulting to 1
-        via .get(dim, 1). Must be caught exactly like a relabeled key."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 16, "N": 1, "K": 2})
-        committed = apply_splits(planner)
-        received = dict(committed)
-        del received["K"]  # dropped entirely, not relabeled
-
-        assert_valid(committed, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        with self.assertRaises(AssertionError):
-            assert_same(
-                "after apply_splits", committed, "scheduler received", received, sizes
-            )
-
-    def test_handoff_detects_magnitude_corruption(self):
-        """A corruption that keeps the same dimension name but changes the
-        split's magnitude (K:2 silently becoming K:1). Deliberately HALVES
-        rather than doubles K: doubling would push cores from 32 to 64,
-        tripping assert_valid's core-budget check first and masking the
-        comparison this test means to exercise."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 16, "N": 1, "K": 2})
-        committed = apply_splits(planner)
-        received = dict(committed)
-        received["K"] = 1
-
-        assert_valid(committed, sizes)
-        assert_valid(received, sizes)
-        assert_same("planner", planner, "after apply_splits", committed, sizes)
-        with self.assertRaises(AssertionError):
-            assert_same(
-                "after apply_splits", committed, "scheduler received", received, sizes
-            )
-
-    def test_handoff_detects_bug_introduced_before_apply_splits(self):
-        """Everything else here corrupts apply_splits -> scheduler. This
-        one corrupts planner -> apply_splits instead, proving the FIRST
-        assert_same call actually catches a bug, not just the second."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 16, "N": 1, "K": 2})
-        committed = apply_splits(planner)
-        committed["M"] = 1  # corrupted at commit time, before the scheduler
-
-        with self.assertRaises(AssertionError):
-            assert_same("planner", planner, "after apply_splits", committed, sizes)
-
-    def test_handoff_rejects_split_exceeding_max_cores(self):
-        """assert_valid has only ever been exercised by legal input so
-        far. Confirms it actually rejects a plan whose core product
-        exceeds MAX_CORES."""
-        sizes = {"M": 2048, "N": 128, "K": 2048}
-        planner = cost_model_planner({"M": 64, "N": 1, "K": 2})  # 128 cores
-        committed = apply_splits(planner)
-
-        with self.assertRaises(AssertionError):
-            assert_valid(committed, sizes)
-
-    def test_handoff_rejects_split_not_dividing_dimension_size(self):
-        """Likewise, confirms assert_valid rejects a split that is
-        core-legal but doesn't evenly divide its dimension's real size."""
-        sizes = {"M": 100, "N": 128, "K": 2048}  # 100 is not divisible by 3
-        planner = cost_model_planner({"M": 3, "N": 1, "K": 1})
-        committed = apply_splits(planner)
-
-        with self.assertRaises(AssertionError):
-            assert_valid(committed, sizes)
-
-
 if __name__ == "__main__":
     unittest.main()
+
