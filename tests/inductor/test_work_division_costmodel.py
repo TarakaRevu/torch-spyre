@@ -165,9 +165,18 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             self.assertGreaterEqual(s, 1, f"{sym}: split {s} < 1")
             self.assertEqual(size % s, 0, f"{sym}: size {size} not divisible by {s}")
 
-    def _run_planner(self, op, it_space, output_td, stick_vars, input_tds,
-                     blocked=None, allowed_splits=None, committed_splits=None,
-                     max_cores=32):
+    def _run_planner(
+        self,
+        op,
+        it_space,
+        output_td,
+        stick_vars,
+        input_tds,
+        blocked=None,
+        allowed_splits=None,
+        committed_splits=None,
+        max_cores=32,
+    ):
         """Thin wrapper: builds default splits={sym:1,...} and calls the real planner."""
         default = {sym: 1 for sym in it_space}
         return _cost_model_matmul_planner(
@@ -227,8 +236,12 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         self._assert_valid_split(splits, it_space)
 
         # Cost model should split M; K=2 sticks is too narrow to split usefully.
-        self.assertGreater(splits.get(m, 1), 1, "planner should split M for prefill QK^T")
-        self.assertEqual(splits.get(k, 1), 1, "planner should not split K for narrow QK^T")
+        self.assertGreater(
+            splits.get(m, 1), 1, "planner should split M for prefill QK^T"
+        )
+        self.assertEqual(
+            splits.get(k, 1), 1, "planner should not split K for narrow QK^T"
+        )
 
     # ------------------------------------------------------------------
     # Batch-split: unrestricted allows B split, blocked {b} keeps B=1
@@ -270,10 +283,10 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
                 op, it_space, output_td, stick_vars, input_tds, blocked={batch}
             )
 
-        self.assertGreater(unrestricted.get(batch, 1), 1,
-                           "unblocked plan should prefer B split")
-        self.assertEqual(restricted.get(batch, 1), 1,
-                         "blocked B must remain unsplit")
+        self.assertGreater(
+            unrestricted.get(batch, 1), 1, "unblocked plan should prefer B split"
+        )
+        self.assertEqual(restricted.get(batch, 1), 1, "blocked B must remain unsplit")
 
     # ------------------------------------------------------------------
     # apply_splits commits ownership; work_slices must reflect the plan.
@@ -319,12 +332,14 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             apply_splits(op, splits)
 
         ownership = getattr(op, "iteration_space_ownership", None)
-        self.assertIsNotNone(ownership,
-                             "apply_splits must set op.iteration_space_ownership")
+        self.assertIsNotNone(
+            ownership, "apply_splits must set op.iteration_space_ownership"
+        )
         for sym, expected in splits.items():
             actual = ownership.work_slices.get(sym, 1)
-            self.assertEqual(actual, expected,
-                             f"work_slices[{sym}]={actual} != planned {expected}")
+            self.assertEqual(
+                actual, expected, f"work_slices[{sym}]={actual} != planned {expected}"
+            )
 
     # ------------------------------------------------------------------
     # Committed split blocks re-entry; planner returns unchanged splits
@@ -351,12 +366,22 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
 
         # Pass a non-empty committed_splits to simulate span_reduction having run
         result = _cost_model_matmul_planner(
-            op, default, it_space, output_td, stick_vars,
+            op,
+            default,
+            it_space,
+            output_td,
+            stick_vars,
             {k: 2},  # committed
-            MAX_CORES, input_tds, set(), {}
+            MAX_CORES,
+            input_tds,
+            set(),
+            {},
         )
-        self.assertEqual(result, default,
-                         "planner must return unchanged defaults when a prior commit exists")
+        self.assertEqual(
+            result,
+            default,
+            "planner must return unchanged defaults when a prior commit exists",
+        )
 
     # ------------------------------------------------------------------
     # Non-matmul op: planner is a no-op
@@ -373,8 +398,7 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         result = _cost_model_matmul_planner(
             op, default, it_space, output_td, {}, {}, MAX_CORES, [], set(), {}
         )
-        self.assertEqual(result, default,
-                         "planner must be a no-op for non-matmul ops")
+        self.assertEqual(result, default, "planner must be a no-op for non-matmul ops")
 
     # ------------------------------------------------------------------
     # Score x V (K >> N shape): cost model should prefer M over N
@@ -410,8 +434,11 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         self._assert_valid_split(splits, it_space)
 
         # With a narrow N (2 sticks) the cost model should prefer M splits
-        self.assertGreater(splits.get(m, 1), 1,
-                           "score x V: planner should split M for heavy-K narrow-N shape")
+        self.assertGreater(
+            splits.get(m, 1),
+            1,
+            "score x V: planner should split M for heavy-K narrow-N shape",
+        )
 
     # ------------------------------------------------------------------
     # apply_splits -> work_slices round-trip for a multi-dim plan
@@ -454,8 +481,9 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
 
         for sym in splits:
             self.assertEqual(
-                splits[sym], received[sym],
-                f"dim {sym}: planner chose {splits[sym]}, scheduler received {received[sym]}"
+                splits[sym],
+                received[sym],
+                f"dim {sym}: planner chose {splits[sym]}, scheduler received {received[sym]}",
             )
 
     # ------------------------------------------------------------------
@@ -496,8 +524,9 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         committed = op.iteration_space_ownership.work_slices
         for sym in splits:
             self.assertEqual(
-                committed.get(sym, 1), splits[sym],
-                f"dim {sym}: planned {splits[sym]}, ownership stored {committed.get(sym, 1)}"
+                committed.get(sym, 1),
+                splits[sym],
+                f"dim {sym}: planned {splits[sym]}, ownership stored {committed.get(sym, 1)}",
             )
         # Now simulate the relabeling: if k were non-1, popping it and
         # re-keying as n would change the n entry and zero out k.
@@ -505,8 +534,9 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         if corrupted.get(k, 1) > 1:
             corrupted[n] = corrupted.pop(k)
             self.assertNotEqual(
-                corrupted.get(k, 1), splits.get(k, 1),
-                "relabeled copy must differ from the original plan on K"
+                corrupted.get(k, 1),
+                splits.get(k, 1),
+                "relabeled copy must differ from the original plan on K",
             )
 
 
@@ -1267,4 +1297,3 @@ class TestPointwise5D6D(_WDTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
