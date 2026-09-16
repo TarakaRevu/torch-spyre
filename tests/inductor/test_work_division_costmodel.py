@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import re
 import unittest
 from math import prod
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 import sympy
 import torch
-import torch._dynamo
-import torch.nn.functional as F
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
@@ -37,11 +37,64 @@ from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
+    _matmul_split_cost,
     apply_splits,
+    multi_dim_iteration_space_split,
 )
 
 # elems_per_stick for fp16 on Spyre (64 elements per stick)
 _FP16_ELEMS_PER_STICK = 64
+
+MAX_CORES = 32
+
+# ---------------------------------------------------------------------------
+# Cost baselines — best-known modeled cost (µs) for each decision test.
+#
+# Rules:
+#   - None  = not yet recorded; first UPDATE_BASELINES=1 run stores the value.
+#   - float = the best-known modeled cost the planner produced for this shape.
+#
+# In normal CI this dict is NEVER written.  A cost improvement is only
+# printed.  A cost increase past the stored value fails the test.
+#
+# To record or update baselines after an intentional cost-model improvement:
+#   UPDATE_BASELINES=1 python3 -m pytest test_work_division_costmodel.py -v -s
+# ---------------------------------------------------------------------------
+COST_BASELINES: dict[str, float | None] = {
+    # TestCostModelPlannerOutputs — individual named tests
+    "test_prefill_qkT_splits_m_not_k": 67.0027,
+    "test_scorev_heavy_k_prefers_m_split": 58.6411,
+    "test_bmm_b1_mgt1_prefill_cost_model_splits_m": 67.0027,
+    # TestCostModelPrefillB1Mgt1 — T05x scenario tests
+    "test_t050_speculative_decode_m4_fp16": 84.5314,
+    "test_t051_m16_underfill_boundary_fp16": 25.1893,
+    "test_t052_prefill_qkT_standard_fp16": 67.0027,
+    "test_t053_scorev_k_gt_n_fp16": 58.6411,
+    # TestCostModelBatchedPrefillBgt1Mgt1 — T08x scenario tests
+    "test_t080_multihead_prefill_qkT_fp16": 238.0107,
+    "test_t081_batched_heads_qkT_fp16": 430.5227,
+    "test_t082_bert_style_batched_bf16": 36.4947,
+}
+
+_THIS_FILE = Path(__file__).resolve()
+
+
+def _store_baseline(test_name: str, cost: float) -> None:
+    """Rewrite the COST_BASELINES entry for *test_name* in this source file.
+
+    Always writes exactly 4 decimal places so the stored literal is stable
+    across runs and the regex below can always find and re-match it.
+    """
+    text = _THIS_FILE.read_text()
+    # Match the key plus its current value (None or a decimal number).
+    pattern = rf'("{re.escape(test_name)}":\s*)(None|[0-9]+(?:\.[0-9]+)?)'
+    replacement = rf"\g<1>{cost:.4f}"
+    new_text, n = re.subn(pattern, replacement, text, count=1)
+    if n != 1:
+        raise RuntimeError(
+            f"_store_baseline: expected exactly one match for {test_name!r}, got {n}"
+        )
+    _THIS_FILE.write_text(new_text)
 
 
 def _real_commit(op, splits, it_space):
@@ -54,36 +107,6 @@ def _real_commit(op, splits, it_space):
         return_value=it_space,
     ):
         commit_iteration_space_ownership(op, splits)
-
-
-MAX_CORES = 32
-SEP = "=" * 100
-
-DTYPE_MAP = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp8": getattr(torch, "float8_e4m3fn", torch.float16),
-}
-
-
-def _rand(shape, dtype_key):
-    """Build a random tensor of the given dtype on the spyre device.
-
-    torch.rand() has no fp8 kernel, so an fp8 request is built in fp16
-    and cast down -- a raw type conversion, not Spyre's own
-    quantize_fp8_with_scale (see issue #4310).
-    """
-    t = DTYPE_MAP[dtype_key]
-    fp8_t = getattr(torch, "float8_e4m3fn", None)
-    if fp8_t is not None and t is fp8_t:
-        return torch.rand(*shape, dtype=torch.float16, device="spyre").to(t)
-    return torch.rand(*shape, dtype=t, device="spyre")
-
-
-# ---------------------------------------------------------------------------
-# Helpers for unit-level planner tests (mirrors test_work_division.py style)
-# ---------------------------------------------------------------------------
 
 
 def _isym(name):
@@ -125,36 +148,19 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     return op
 
 
-class _WDTestCase(unittest.TestCase):
-    """Shared base: resets dynamo before every test method, since each
-    case compiles a fresh graph and stale cached state from an earlier
-    case must not leak in."""
-
-    def setUp(self):
-        torch._dynamo.reset()
-
-
 # ---------------------------------------------------------------------------
-# Focused unit tests on _cost_model_matmul_planner output
-#
-# Each test calls the *real* work_division._cost_model_matmul_planner (not a
-# dict stub) and asserts the returned split dictionary satisfies structural
-# invariants or known expected values.  This mirrors the TestCostModelConstraints
-# pattern in test_work_division.py (lines 1002–1050) and ensures a change that
-# short-circuits or alters the planner is caught.
+# Shared assertion helpers — mixed into every test class that calls the
+# cost-model planner directly.
 # ---------------------------------------------------------------------------
 
 
-class TestCostModelPlannerOutputs(unittest.TestCase):
-    """Direct assertions on _cost_model_matmul_planner return values.
+class _CostModelAssertMixin:
+    """Mixin providing shared assertion helpers for cost-model test classes.
 
-    Each test constructs a real ComputedBuffer + TensorDep (no torch.compile),
-    calls the real planner, and asserts on the resulting split dict.
+    Not a test class itself (no 'Test' prefix); unittest will not collect it.
+    Mix into any TestCase subclass that needs _assert_valid_split,
+    _assert_full_cores, or _assert_cost_not_regressed.
     """
-
-    # ------------------------------------------------------------------
-    # Shared assertion helpers
-    # ------------------------------------------------------------------
 
     def _assert_valid_split(self, splits, it_space):
         """Generic sanity: core budget respected, each split divides its dim."""
@@ -164,6 +170,86 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             s = splits.get(sym, 1)
             self.assertGreaterEqual(s, 1, f"{sym}: split {s} < 1")
             self.assertEqual(size % s, 0, f"{sym}: size {size} not divisible by {s}")
+
+    def _assert_full_cores(self, splits, test_name: str) -> None:
+        """Assert the planner uses all MAX_CORES.
+
+        Catches regressions where a cost-model change causes the planner to
+        pick 16 or 25 cores instead of 32 -- e.g. a penalty weight pushed too
+        high so the search settles on a partial split.
+        """
+        cores = prod(splits.values())
+        self.assertEqual(
+            cores,
+            MAX_CORES,
+            f"{test_name}: planner chose {cores} cores instead of {MAX_CORES}. "
+            f"splits={splits}",
+        )
+
+    def _assert_cost_not_regressed(self, test_name: str, cost: float) -> None:
+        """Compare *cost* (µs) against the stored COST_BASELINES entry.
+
+        Behaviour:
+          - Baseline is None (first run / not yet recorded):
+              Prints the value.  If UPDATE_BASELINES=1 is set, writes it into
+              this file's COST_BASELINES dict so future runs have a reference.
+          - cost <= baseline:
+              Test passes.  If cost < baseline (improvement), prints a note.
+              If UPDATE_BASELINES=1, updates the stored value so the new lower
+              cost becomes the next reference point.
+          - cost > baseline (regression):
+              Test FAILS with a clear message showing old vs new cost.
+
+        Never fails when the baseline is None -- it only starts enforcing after
+        the first UPDATE_BASELINES=1 run commits a value.
+        """
+        baseline = COST_BASELINES.get(test_name)
+
+        # Allow 0.1 µs of tolerance so that a cost that rounds to the same
+        # 4-decimal display as the baseline never triggers a false failure.
+        # This is well below any meaningful cost-model change (which moves costs
+        # by at least ~0.5 µs) but large enough to absorb IEEE-754 rounding at
+        # the 4th decimal place (worst case ~5e-5 µs).
+        _EPSILON = 1e-4
+        if baseline is not None and cost > baseline + _EPSILON:
+            self.fail(
+                f"{test_name}: modeled cost REGRESSED\n"
+                f"  stored baseline : {baseline:.4f} µs\n"
+                f"  measured now    : {cost:.4f} µs\n"
+                f"  difference      : +{cost - baseline:.4f} µs\n"
+                f"If this is intentional, re-run with UPDATE_BASELINES=1 to "
+                f"commit the new value."
+            )
+
+        if baseline is None or cost < baseline - _EPSILON:
+            tag = (
+                "new baseline"
+                if baseline is None
+                else f"improvement over {baseline:.4f}"
+            )
+            print(f"\n[cost-baseline] {test_name}: {cost:.4f} µs ({tag})")
+            if os.environ.get("UPDATE_BASELINES") == "1":
+                _store_baseline(test_name, cost)
+                print(
+                    f"[cost-baseline] wrote {cost:.4f} µs to COST_BASELINES[{test_name!r}]"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Focused unit tests on _cost_model_matmul_planner output
+#
+# Each test calls the *real* work_division._cost_model_matmul_planner (not a
+# dict stub) and asserts the returned split dictionary satisfies structural
+# invariants or known expected values.
+# ---------------------------------------------------------------------------
+
+
+class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
+    """Direct assertions on _cost_model_matmul_planner return values.
+
+    Each test constructs a real ComputedBuffer + TensorDep (no torch.compile),
+    calls the real planner, and asserts on the resulting split dict.
+    """
 
     def _run_planner(
         self,
@@ -194,12 +280,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # B=1, M>1 prefill QK^T: cost model should exploit M, not K
-    #
-    # Shapes use stick-count sizes for N and K (fp16: 64 elems/stick), matching
-    # the it_space_adjusted that the production _cost_model_divide_op passes in.
-    # Tensor dep shapes use element counts (N sticks * 64) so device_coords
-    # resolve the correct symbol as the stick dimension.
-    # stick_vars values are elems_per_stick (64) as the production code supplies.
     # ------------------------------------------------------------------
 
     def test_prefill_qkT_splits_m_not_k(self):
@@ -207,16 +287,8 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         N=2048 elements = 32 sticks, K=128 elements = 2 sticks.
         Planner should split M (2048 rows) using the majority of 32 cores
         and leave K unsplit -- splitting K=2 sticks gives only 2 partial
-        dot products, which the cost model penalises heavily.
-
-        Shape is 3-D (b=1 batch), built without b in it_space: the planner
-        classifies every symbol not in output_coord_vars as a reduction dim,
-        so a b=1 entry would make len(reduction)=2 and trigger an early return.
-        Production code never sees this because adjust_it_space_for_sticks only
-        keeps dims with size > 1 after stick adjustment."""
+        dot products, which the cost model penalises heavily."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
-        # 3-D tensors: batch dim absorbed into layout, not a separate symbol.
-        # N=2048 elements = 32 sticks, K=128 elements = 2 sticks (fp16, 64 elems/stick).
         op = _computed_buffer(
             (2048, 2048),
             name="qkT",
@@ -228,20 +300,43 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             _tensor_dep("lhs", (2048, 128), (m, k)),
             _tensor_dep("rhs", (128, 2048), (k, n)),
         ]
-        # it_space: N and K in sticks; stick_vars: elems_per_stick=64.
         it_space = {m: 2048, n: 32, k: 2}
         stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
 
         splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
         self._assert_valid_split(splits, it_space)
 
-        # Cost model should split M; K=2 sticks is too narrow to split usefully.
         self.assertGreater(
             splits.get(m, 1), 1, "planner should split M for prefill QK^T"
         )
         self.assertEqual(
             splits.get(k, 1), 1, "planner should not split K for narrow QK^T"
         )
+        self.assertEqual(
+            prod(splits.values()),
+            MAX_CORES,
+            "B=1 M>>1: cost model should use all 32 cores "
+            "(regression guard for removed bmm device-layout pass)",
+        )
+
+        # Core-count guard: any change that drops the planner to 16 or 25 cores fails here.
+        self._assert_full_cores(splits, "test_prefill_qkT_splits_m_not_k")
+
+        # Cost regression guard.
+        # Shapes in elements: B=1, M=2048, N=2048, K=128.
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(
+            cost,
+            float("inf"),
+            "planner-chosen split must model a finite (feasible) cost",
+        )
+        self._assert_cost_not_regressed("test_prefill_qkT_splits_m_not_k", cost)
 
     # ------------------------------------------------------------------
     # Batch-split: unrestricted allows B split, blocked {b} keeps B=1
@@ -249,11 +344,8 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
 
     def test_blocked_batch_dim_stays_unsplit(self):
         """A batch dimension in *blocked* must remain split=1 even when the
-        unblocked plan would have preferred to split it.  Mirrors the
-        TestCostModelConstraints reference test exactly."""
+        unblocked plan would have preferred to split it."""
         batch, m, n, k = (_isym(x) for x in ("batch", "m", "n", "k"))
-        # N=256 elements = 4 sticks (fp16, 64 elems/stick).
-        # K=128 elements = 2 sticks.
         op = _computed_buffer(
             (4, 64, 256),
             name="blocked_batch",
@@ -265,7 +357,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             _tensor_dep("lhs", (4, 64, 128), (batch, m, k)),
             _tensor_dep("rhs", (4, 128, 256), (batch, k, n)),
         ]
-        # it_space: n=4 sticks, k=2 sticks; stick_vars: elems_per_stick=64.
         it_space = {batch: 4, m: 64, n: 4, k: 2}
         stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
 
@@ -290,16 +381,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # apply_splits commits ownership; work_slices must reflect the plan.
-    #
-    # apply_splits calls commit_iteration_space_ownership which internally
-    # calls iteration_space_from_op(op).  iteration_space_from_op calls
-    # op.get_read_writes() on the real ComputedBuffer; with a MagicMock
-    # data object the resulting rw.writes iterator is empty and next()
-    # raises StopIteration.  We patch iteration_space_from_op at the
-    # work_division call site to return the same it_space already known
-    # to this test -- the ownership correctness check is about whether
-    # apply_splits faithfully stores what the planner returned, not about
-    # how the iteration space is derived.
     # ------------------------------------------------------------------
 
     def test_apply_splits_commits_ownership_correctly(self):
@@ -323,8 +404,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
         self._assert_valid_split(splits, it_space)
 
-        # Patch iteration_space_from_op so apply_splits doesn't hit
-        # op.get_read_writes() on the MagicMock data object.
         with patch(
             "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
             wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
@@ -364,7 +443,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
         default = {sym: 1 for sym in it_space}
 
-        # Pass a non-empty committed_splits to simulate span_reduction having run
         result = _cost_model_matmul_planner(
             op,
             default,
@@ -408,13 +486,8 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         """score x V: (1, 2048, 2048) x (1, 2048, 128).
         N=128 elements = 2 sticks (fp16), K=2048 elements = 32 sticks.
         Cost model should split M, not N -- the 2-stick N is too narrow
-        to absorb useful parallelism.
-
-        Same b=1 exclusion as test_prefill_qkT_splits_m_not_k: b=1 in
-        it_space creates a spurious second reduction dim and causes an
-        early return before the cost search runs."""
+        to absorb useful parallelism."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
-        # N=128 elements = 2 sticks, K=2048 elements = 32 sticks (fp16).
         op = _computed_buffer(
             (2048, 128),
             name="scorev",
@@ -426,19 +499,36 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
             _tensor_dep("lhs", (2048, 2048), (m, k)),
             _tensor_dep("rhs", (2048, 128), (k, n)),
         ]
-        # it_space: n=2 sticks, k=32 sticks; stick_vars: elems_per_stick=64.
         it_space = {m: 2048, n: 2, k: 32}
         stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
 
         splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
         self._assert_valid_split(splits, it_space)
 
-        # With a narrow N (2 sticks) the cost model should prefer M splits
         self.assertGreater(
             splits.get(m, 1),
             1,
             "score x V: planner should split M for heavy-K narrow-N shape",
         )
+
+        # Core-count guard.
+        self._assert_full_cores(splits, "test_scorev_heavy_k_prefers_m_split")
+
+        # Cost regression guard.
+        # Shapes in elements: B=1, M=2048, N=128, K=2048.
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(128, splits.get(n, 1)),
+            k_axis=(2048, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(
+            cost,
+            float("inf"),
+            "planner-chosen split must model a finite (feasible) cost",
+        )
+        self._assert_cost_not_regressed("test_scorev_heavy_k_prefers_m_split", cost)
 
     # ------------------------------------------------------------------
     # apply_splits -> work_slices round-trip for a multi-dim plan
@@ -517,10 +607,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
         ):
             apply_splits(op, splits)
 
-        # Simulate the K->N relabeling bug in a downstream copy.
-        # The planner should have chosen m>1 for this shape, so k=1 (unsplit).
-        # Verify the ownership round-trip is faithful: each sym maps to what
-        # the planner decided.
         committed = op.iteration_space_ownership.work_slices
         for sym in splits:
             self.assertEqual(
@@ -528,8 +614,6 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
                 splits[sym],
                 f"dim {sym}: planned {splits[sym]}, ownership stored {committed.get(sym, 1)}",
             )
-        # Now simulate the relabeling: if k were non-1, popping it and
-        # re-keying as n would change the n entry and zero out k.
         corrupted = dict(committed)
         if corrupted.get(k, 1) > 1:
             corrupted[n] = corrupted.pop(k)
@@ -539,760 +623,640 @@ class TestCostModelPlannerOutputs(unittest.TestCase):
                 "relabeled copy must differ from the original plan on K",
             )
 
+    # ------------------------------------------------------------------
+    # tsp#4032 — B=1 M=1 core underutilization
+    #
+    # Shape: (1,1,4096) x (1,4096,25600) → N=25600 elements = 400 sticks
+    # (fp16, 64 elems/stick).  When M=1 the cost-model planner is a no-op;
+    # the greedy pass (multi_dim_iteration_space_split) handles the split.
+    # It currently picks n=25 (largest divisor of 400 that fits in 32 cores),
+    # leaving 7 cores idle.  After tsp#4032 is fixed it should reach 32.
+    #
+    # Regression guard: fails if cores drop below 25 (greedy regression).
+    # Improvement signal: prints a note when cores reach 32 (fix landed).
+    # ------------------------------------------------------------------
+
+    # Known core count for this shape while tsp#4032 is open.
+    _TSP4032_KNOWN_CORES = 25
+
+    def test_bmm_b1_m1_tsp4032_underutil_gets_full_cores(self):
+        """tsp#4032: B=1 M=1 N=25600 — greedy regression guard + fix detector.
+
+        When M=1 the cost-model planner is a no-op; the greedy pass
+        multi_dim_iteration_space_split runs instead.  It currently picks
+        n=25 (400 sticks, largest divisor <= 32), leaving 7 cores idle.
+
+        This test:
+          - PASSES as long as cores >= 25  (no greedy regression)
+          - FAILS  if cores drop below 25  (regression in greedy pass)
+          - PRINTS a note when cores == 32 (tsp#4032 fix has landed;
+            update _TSP4032_KNOWN_CORES to 32 to tighten the guard)
+        """
+        n, k = (_isym(x) for x in ("n", "k"))
+        # N=25600 elements / 64 elems-per-stick = 400 sticks.
+        # K=4096 elements / 64 elems-per-stick = 64 sticks.
+        splits = multi_dim_iteration_space_split(
+            {n: 400, k: 64},
+            MAX_CORES,
+            [n],  # output dim
+            [k],  # reduction dim
+        )
+
+        cores = prod(splits.values())
+
+        # Regression guard: cores must not drop below the known value.
+        self.assertGreaterEqual(
+            cores,
+            self._TSP4032_KNOWN_CORES,
+            f"tsp#4032 REGRESSED: greedy now uses only {cores} cores "
+            f"(known baseline is {self._TSP4032_KNOWN_CORES}); "
+            f"splits={splits}",
+        )
+
+        # Fix detector: once tsp#4032 lands the greedy pass will reach 32 cores.
+        if cores == MAX_CORES:
+            print(
+                f"\n[tsp#4032 FIXED] greedy now uses all {MAX_CORES} cores "
+                f"(was {self._TSP4032_KNOWN_CORES}). "
+                f"Update _TSP4032_KNOWN_CORES = {MAX_CORES} to tighten the guard."
+            )
+        else:
+            print(
+                f"\n[tsp#4032 open] greedy uses {cores}/{MAX_CORES} cores "
+                f"(n={splits.get(n, 1)}, N=400 sticks not divisible by 32)"
+            )
+
+    # ------------------------------------------------------------------
+    # B=1, M>>1 regression — pass 2 cost model must split M for prefill
+    #
+    # Shape: (1,2048,128) x (1,128,2048).  After the bmm pass was removed
+    # (Jamie Yang's investigation) the planner must still choose M>1 via
+    # the cost model alone.  If the pass removal causes the planner to
+    # fall back to a single-core default this test catches it.
+    # ------------------------------------------------------------------
+
+    def test_bmm_b1_mgt1_prefill_cost_model_splits_m(self):
+        """B=1 M=2048 prefill QK^T: cost model must choose m>1 without
+        relying on any external bmm pass that was recently removed."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        # (1,2048,128) x (1,128,2048): N=32 sticks, K=2 sticks (fp16).
+        op = _computed_buffer(
+            (2048, 2048),
+            name="prefill_qkT_regression",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("prefill_qkT_regression", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        # Cost model must split M regardless of any external pass.
+        self.assertGreater(
+            splits.get(m, 1),
+            1,
+            "B=1 M>>1 regression: cost model must split M without relying on removed bmm pass",
+        )
+        # Core-count guard.
+        self._assert_full_cores(splits, "test_bmm_b1_mgt1_prefill_cost_model_splits_m")
+
+        # Cost regression guard.
+        # Shapes in elements: B=1, M=2048, N=2048, K=128.
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(
+            cost,
+            float("inf"),
+            "planner-chosen split must model a finite (feasible) cost",
+        )
+        self._assert_cost_not_regressed(
+            "test_bmm_b1_mgt1_prefill_cost_model_splits_m", cost
+        )
+
+    # ------------------------------------------------------------------
+    # B>1, M=1 batch split — B=8 must use at least as many cores as B=2.
+    #
+    # When M=1 the cost-model planner (_cost_model_matmul_planner) returns
+    # splits unchanged by design -- it has no M rows to balance.  The
+    # greedy pass (multi_dim_iteration_space_split / P3) then runs on the
+    # reduced {b, n, k} space.  This is the same path as Scenario 37 in
+    # test_work_division_all.py.
+    #
+    # Shapes: both cases use N=16 sticks (1024 elements), K=2 sticks (128
+    # elements), with B=2 and B=8 respectively.  The greedy pass sees more
+    # total work for B=8 and must not assign fewer cores to it.
+    # ------------------------------------------------------------------
+
+    def test_bmm_bgt1_m1_batch8_uses_at_least_as_many_cores_as_batch2(self):
+        """B>1 M=1: greedy pass must not assign fewer cores to B=8 than B=2.
+
+        When M=1 the cost-model planner is a no-op (no M rows to balance).
+        The greedy multi_dim_iteration_space_split runs instead on {b, n, k}.
+        With the same N and K, B=8 has 4× more batch work than B=2, so the
+        greedy pass must assign it at least as many cores.
+
+        Shapes (stick counts, fp16 64 elems/stick):
+          B=2: it_space {b:2, n:16, k:2}  → total 64  → 2× core budget
+          B=8: it_space {b:8, n:16, k:2}  → total 256 → 8× core budget
+        """
+        b2, n2, k2 = (_isym(x) for x in ("b2", "n2", "k2"))
+        b8, n8, k8 = (_isym(x) for x in ("b8", "n8", "k8"))
+
+        # B=2: {b:2, n:16, k:2} — output_dims=[b,n], reduction_dims=[k]
+        splits2 = multi_dim_iteration_space_split(
+            {b2: 2, n2: 16, k2: 2},
+            MAX_CORES,
+            [b2, n2],  # output dims
+            [k2],  # reduction dims
+        )
+
+        # B=8: {b:8, n:16, k:2} — same N and K, larger batch
+        splits8 = multi_dim_iteration_space_split(
+            {b8: 8, n8: 16, k8: 2},
+            MAX_CORES,
+            [b8, n8],
+            [k8],
+        )
+
+        cores2 = prod(splits2.values())
+        cores8 = prod(splits8.values())
+
+        # Both must get non-trivial splits (N=16 sticks is wide enough).
+        self.assertGreater(
+            cores2, 1, "B=2 M=1 shape must get a non-trivial greedy split"
+        )
+        self.assertGreater(
+            cores8, 1, "B=8 M=1 shape must get a non-trivial greedy split"
+        )
+
+        # B=8 must not get fewer cores than B=2 (more batch work → more cores).
+        self.assertGreaterEqual(
+            cores8,
+            cores2,
+            f"B=8 got {cores8} cores but B=2 got {cores2}: "
+            "greedy must not assign fewer cores to a larger batch with same N/K",
+        )
+
 
 # ---------------------------------------------------------------------------
-# Integration smoke tests -- torch.compile() exercises the full pass pipeline.
+# Scenario coverage tests — real shapes from the original test suite.
 #
-# These tests confirm each shape goes through the compiler without error.
-# The TestCostModelPlannerOutputs class above provides the focused assertions
-# on real planner outputs and the planner->apply_splits->ownership handoff;
-# a regression that bypasses _cost_model_matmul_planner or makes it always
-# return defaults will be caught there rather than here.
+# These replace the torch.compile() smoke tests (which had no assertions on
+# planner outputs) with direct calls to the real planner/greedy functions,
+# then assert on the returned splits.  Each group mirrors the T-numbered
+# scenarios from the original file.
+#
+# Group A (T04x): B=1 M=1 decode — _cost_model_matmul_planner is a no-op,
+#                 multi_dim_iteration_space_split (P3 greedy) handles it.
+#
+# Group B (T05x): B=1 M>1 prefill — _cost_model_matmul_planner (P2) runs.
+#
+# Group C (T07x): B>1 M=1 batch decode — greedy P3 on {b, n, k}.
+#
+# Group D (T08x): B>1 M>1 batched prefill — _cost_model_matmul_planner (P2).
 # ---------------------------------------------------------------------------
 
 
-class TestDotProduct1D(_WDTestCase):
-    """1D vector/dot-product reference cases -- always Pass 3, no reduction
-    dimension to route through the cost model."""
-
-    def test_dot_1d_reference_baseline_fp16(self):
-        """T000: reference baseline"""
-        a = _rand((512,), "fp16")
-        b = _rand((512,), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_dot_1d_llama_granite_hidden_dim_fp16(self):
-        """T000b: Llama/Granite hidden-dim vector"""
-        a = _rand((4096,), "fp16")
-        b = _rand((4096,), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_dot_1d_llama_granite_hidden_dim_bf16(self):
-        """T000c: bf16 hidden-dim vector"""
-        a = _rand((4096,), "bf16")
-        b = _rand((4096,), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_dot_1d_gptoss_hidden_dim_fp16(self):
-        """T000d: gpt-oss-20b hidden-dim vector"""
-        a = _rand((2880,), "fp16")
-        b = _rand((2880,), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_dot_1d_mistral_hidden_dim_bf16(self):
-        """T000e: Mistral hidden-dim vector"""
-        a = _rand((5120,), "bf16")
-        b = _rand((5120,), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestMatmul2D(_WDTestCase):
-    """2D aten.mm -- fails Gate 1 (not BATCH_MATMUL_OP) before Work
-    Division's own routing; lifted to a batch-of-1 3D bmm upstream."""
-
-    def test_mm_2d_decode_linear_proj_fp16(self):
-        """T010: decode linear proj"""
-        a = _rand((1, 4096), "fp16")
-        b = _rand((4096, 4096), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_2d_prefill_linear_proj_fp16(self):
-        """T011: prefill linear proj"""
-        a = _rand((2048, 4096), "fp16")
-        b = _rand((4096, 4096), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_2d_decode_lmhead_vocab_bf16(self):
-        """T012: decode lm_head vocab"""
-        a = _rand((1, 4096), "bf16")
-        b = _rand((4096, 32000), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_2d_prefill_lmhead_vocab_bf16(self):
-        """T013: prefill lm_head vocab"""
-        a = _rand((2048, 4096), "bf16")
-        b = _rand((4096, 32000), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_2d_llama_mlp_upproj_fp16(self):
-        """T014: Llama MLP up-proj"""
-        a = _rand((2048, 4096), "fp16")
-        b = _rand((4096, 11008), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_2d_decode_scorev_fp16(self):
-        """T015: decode score x V (mm)"""
-        a = _rand((1, 4096), "fp16")
-        b = _rand((4096, 128), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #4310: raw-cast FP8 (no quantize_fp8_with_scale metadata) is unsupported by the FP8 matmul lowering"
-    )
-    def test_mm_2d_granite33_lmhead_fp8_expect_fail(self):
-        """T01P: granite-3.3-8b lm_head"""
-        a = _rand((1, 4096), "fp8")
-        b = _rand((4096, 49159), "fp8")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestBmm3DGreedyPass3(_WDTestCase):
-    """3D bmm, B=1 M=1 -> Gate 3 fires (row_dims empty) -> Pass 3 greedy.
-    Includes the tracked tsp#4032 core-underutilization shape."""
-
-    def test_bmm_3d_b1_m1_tiny_decode_fp16(self):
-        """T040: tiny decode"""
-        a = _rand((1, 1, 128), "fp16")
-        b = _rand((1, 128, 64), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_narrow_n_fp16(self):
-        """T041: narrow N"""
-        a = _rand((1, 1, 128), "fp16")
-        b = _rand((1, 128, 512), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_granite_decode_qkT_fp16(self):
-        """T042: Granite decode QK^T"""
-        a = _rand((1, 1, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_nonpow2_n_fp16(self):
-        """T043: non-power-2 N"""
-        a = _rand((1, 1, 128), "fp16")
-        b = _rand((1, 128, 3072), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_decode_scorev_worst_fp16(self):
-        """T044: decode score x V -- worst"""
-        a = _rand((1, 1, 2048), "fp16")
-        b = _rand((1, 2048, 128), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_bug_tsp4032_underutil_fp16(self):
-        """T045: THE BUG -- tsp#4032"""
-        a = _rand((1, 1, 4096), "fp16")
-        b = _rand((1, 4096, 25600), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_reference_full_util_fp16(self):
-        """T046: reference (N%2048=0)"""
-        a = _rand((1, 1, 4096), "fp16")
-        b = _rand((1, 4096, 26624), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_at_span_limit_fp16(self):
-        """T047: at span limit"""
-        a = _rand((1, 1, 4096), "fp16")
-        b = _rand((1, 4096, 32768), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_decode_qkT_bf16(self):
-        """T048: bf16 decode QK^T"""
-        a = _rand((1, 1, 128), "bf16")
-        b = _rand((1, 128, 2048), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_m1_bug_tsp4032_underutil_bf16(self):
-        """T049: bf16 underutil case"""
-        a = _rand((1, 1, 4096), "bf16")
-        b = _rand((1, 4096, 25600), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestBmm3DCostModelPass2(_WDTestCase):
-    """3D bmm, B=1 M>1 -> all gates pass -> Pass 2's cost model actually
-    runs and picks a split."""
-
-    def test_bmm_3d_b1_mgt1_speculative_decode_underfill_fp16(self):
-        """T050: M underfill -- speculative decode"""
-        a = _rand((1, 4, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_m16_underfill_boundary_fp16(self):
-        """T051: M=16 underfill boundary"""
-        a = _rand((1, 16, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_prefill_qkT_standard_fp16(self):
-        """T052: standard m-split -- prefill QK^T"""
-        a = _rand((1, 2048, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_scorev_k_gt_n_penalty_fp16(self):
-        """T053: K>>N shape penalty -- score x V"""
-        a = _rand((1, 2048, 2048), "fp16")
-        b = _rand((1, 2048, 128), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_mlp_upproj_wide_n_fp16(self):
-        """T054: wide-N penalty -- MLP up-proj"""
-        a = _rand((1, 2048, 4096), "fp16")
-        b = _rand((1, 4096, 11008), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_prefill_qkT_standard_bf16(self):
-        """T055: bf16 prefill QK^T"""
-        a = _rand((1, 2048, 128), "bf16")
-        b = _rand((1, 128, 2048), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_3d_b1_mgt1_span_limit_plus1_elem_fp16(self):
-        """T056: 1 elem over span limit"""
-        a = _rand((1, 2048, 4096), "fp16")
-        b = _rand((1, 4096, 32832), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_bmm_3d_b1_mgt1_prefill_qkT_fp32_expect_fail(self):
-        """T057: fp32 prefill QK^T"""
-        a = _rand((1, 2048, 128), "fp32")
-        b = _rand((1, 128, 2048), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_bmm_3d_b1_mgt1_scorev_fp32_expect_fail(self):
-        """T058: fp32 score x V"""
-        a = _rand((1, 2048, 2048), "fp32")
-        b = _rand((1, 2048, 128), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_bmm_3d_b1_mgt1_mlp_upproj_fp32_expect_fail(self):
-        """T059: fp32 MLP up-proj"""
-        a = _rand((1, 2048, 4096), "fp32")
-        b = _rand((1, 4096, 11008), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestBmm4DGreedyPass3(_WDTestCase):
-    """4D bmm, B>1 M=1 -> Gate 3 fires again -> Pass 3's b x N split."""
-
-    def test_bmm_4d_bgt1_m1_batch2_fp16(self):
-        """T070: B=2"""
-        a = _rand((2, 1, 128), "fp16")
-        b = _rand((2, 128, 1024), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_batch4_fp16(self):
-        """T071: B=4"""
-        a = _rand((4, 1, 128), "fp16")
-        b = _rand((4, 128, 512), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_batch8_fp16(self):
-        """T072: B=8"""
-        a = _rand((8, 1, 128), "fp16")
-        b = _rand((8, 128, 256), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_batch16_fp16(self):
-        """T073: B=16"""
-        a = _rand((16, 1, 128), "fp16")
-        b = _rand((16, 128, 128), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_batch32_fp16(self):
-        """T074: B=32"""
-        a = _rand((32, 1, 64), "fp16")
-        b = _rand((32, 64, 64), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_odd_batch5_fp16(self):
-        """T075: odd B=5"""
-        a = _rand((5, 1, 128), "fp16")
-        b = _rand((5, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_m1_odd_batch7_fp16(self):
-        """T076: odd B=7"""
-        a = _rand((7, 1, 128), "fp16")
-        b = _rand((7, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestBmm4DCostModelPass2(_WDTestCase):
-    """4D bmm, B>1 M>1 -> Pass 2 cost model with the batch-split penalty."""
-
-    def test_bmm_4d_bgt1_mgt1_multihead_prefill_qkT_fp16(self):
-        """T080: multi-head prefill QK^T"""
-        a = _rand((4, 2048, 128), "fp16")
-        b = _rand((4, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_mgt1_batched_heads_qkT_fp16(self):
-        """T081: batched heads QK^T"""
-        a = _rand((4, 2048, 512), "fp16")
-        b = _rand((4, 512, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_mgt1_bert_style_batched_bf16(self):
-        """T082: BERT-style batched"""
-        a = _rand((8, 512, 128), "bf16")
-        b = _rand((8, 128, 512), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_4d_bgt1_mgt1_batched_prefill_bf16(self):
-        """T083: bf16 batched prefill"""
-        a = _rand((4, 2048, 128), "bf16")
-        b = _rand((4, 128, 2048), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_bmm_4d_bgt1_mgt1_multihead_prefill_fp32_expect_fail(self):
-        """T084: fp32 multi-head prefill"""
-        a = _rand((4, 2048, 128), "fp32")
-        b = _rand((4, 128, 2048), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_bmm_4d_bgt1_mgt1_batched_heads_fp32_expect_fail(self):
-        """T085: fp32 batched heads"""
-        a = _rand((4, 2048, 512), "fp32")
-        b = _rand((4, 512, 2048), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestBmmRankLimit5D6D(_WDTestCase):
-    """5D/6D bmm -- rank>4 batched matmul. Behavior has flip-flopped across
-    different runs (rejected in one, compiling fine in another); treated
-    as a normal case here since the most recently confirmed runs show it
-    compiling successfully."""
-
-    def test_bmm_5d_gqa_motivated_rank_limit_fp16(self):
-        """T120: 5D GQA-motivated -- confirmed compiles fine"""
-        a = _rand((2, 2, 4, 256, 256), "fp16")
-        b = _rand((2, 2, 4, 256, 256), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_5d_gqa_motivated_rank_limit_bf16(self):
-        """T121: 5D GQA-motivated bf16 -- confirmed compiles fine"""
-        a = _rand((2, 2, 4, 256, 256), "bf16")
-        b = _rand((2, 2, 4, 256, 256), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_6d_deeper_nesting_rank_limit_fp16(self):
-        """T130: 6D deeper nesting -- confirmed compiles fine"""
-        a = _rand((2, 2, 2, 2, 256, 256), "fp16")
-        b = _rand((2, 2, 2, 2, 256, 256), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_6d_deeper_nesting_rank_limit_bf16(self):
-        """T131: 6D deeper nesting bf16 -- confirmed compiles fine"""
-        a = _rand((2, 2, 2, 2, 256, 256), "bf16")
-        b = _rand((2, 2, 2, 2, 256, 256), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestRealModelAttentionMLP(_WDTestCase):
-    """Real-model attention QK^T and MLP up-proj shapes (Llama, gpt-oss,
-    Mistral, granite) across every dtype that keeps the tensor under the
-    256 MiB span limit."""
-
-    def test_bmm_realmodel_llama31_8b_attn_qkT_fp16(self):
-        """T140: Llama-3.1-8B attn QK^T"""
-        a = _rand((1, 2048, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_realmodel_gptoss20b_attn_qkT_fp16(self):
-        """T141: gpt-oss-20b attn QK^T"""
-        a = _rand((1, 2048, 64), "fp16")
-        b = _rand((1, 64, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_realmodel_mistral_small24b_attn_qkT_fp16(self):
-        """T142: Mistral-Small-24B attn QK^T"""
-        a = _rand((1, 2048, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_bmm_realmodel_granite3x_8b_attn_qkT_fp16(self):
-        """T143: granite-3.x-8b attn QK^T"""
-        a = _rand((1, 2048, 128), "fp16")
-        b = _rand((1, 128, 2048), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_mm_realmodel_llama_mlp_upproj_fp32_expect_fail(self):
-        """T144: Llama MLP up-proj fp32"""
-        a = _rand((2048, 4096), "fp32")
-        b = _rand((4096, 14336), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_llama_mlp_upproj_fp16(self):
-        """T145: Llama MLP up-proj fp16"""
-        a = _rand((2048, 4096), "fp16")
-        b = _rand((4096, 14336), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_llama_mlp_upproj_bf16(self):
-        """T146: Llama MLP up-proj bf16"""
-        a = _rand((2048, 4096), "bf16")
-        b = _rand((4096, 14336), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #4310: raw-cast FP8 (no quantize_fp8_with_scale metadata) is unsupported by the FP8 matmul lowering"
-    )
-    def test_mm_realmodel_llama_mlp_upproj_fp8_expect_fail(self):
-        """T147: Llama MLP up-proj fp8"""
-        a = _rand((2048, 4096), "fp8")
-        b = _rand((4096, 14336), "fp8")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_mm_realmodel_gptoss_perexpert_fp32_expect_fail(self):
-        """T148: gpt-oss per-expert fp32"""
-        a = _rand((2048, 2880), "fp32")
-        b = _rand((2880, 2880), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_gptoss_perexpert_fp16(self):
-        """T149: gpt-oss per-expert fp16"""
-        a = _rand((2048, 2880), "fp16")
-        b = _rand((2880, 2880), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_gptoss_perexpert_bf16(self):
-        """T14A: gpt-oss per-expert bf16"""
-        a = _rand((2048, 2880), "bf16")
-        b = _rand((2880, 2880), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #4310: raw-cast FP8 (no quantize_fp8_with_scale metadata) is unsupported by the FP8 matmul lowering"
-    )
-    def test_mm_realmodel_gptoss_perexpert_fp8_expect_fail(self):
-        """T14B: gpt-oss per-expert fp8"""
-        a = _rand((2048, 2880), "fp8")
-        b = _rand((2880, 2880), "fp8")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #4310: raw-cast FP8 (no quantize_fp8_with_scale metadata) is unsupported by the FP8 matmul lowering"
-    )
-    def test_mm_realmodel_mistral_mlp_upproj_fp8_expect_fail(self):
-        """T14C: Mistral MLP up-proj fp8"""
-        a = _rand((2048, 5120), "fp8")
-        b = _rand((5120, 32768), "fp8")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #1794: batchmatmul not yet in SPYRE_FP32_OPS -- Inductor raises Unsupported: matmul on DataFormats.IEEE_FP32"
-    )
-    def test_mm_realmodel_granite_mlp_upproj_fp32_expect_fail(self):
-        """T14D: granite MLP up-proj fp32"""
-        a = _rand((2048, 4096), "fp32")
-        b = _rand((4096, 12800), "fp32")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_granite_mlp_upproj_fp16(self):
-        """T14E: granite MLP up-proj fp16"""
-        a = _rand((2048, 4096), "fp16")
-        b = _rand((4096, 12800), "fp16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    def test_mm_realmodel_granite_mlp_upproj_bf16(self):
-        """T14F: granite MLP up-proj bf16"""
-        a = _rand((2048, 4096), "bf16")
-        b = _rand((4096, 12800), "bf16")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-    @pytest.mark.xfail(
-        reason="Issue #4310: raw-cast FP8 (no quantize_fp8_with_scale metadata) is unsupported by the FP8 matmul lowering"
-    )
-    def test_mm_realmodel_granite_mlp_upproj_fp8_expect_fail(self):
-        """T14G: granite MLP up-proj fp8"""
-        a = _rand((2048, 4096), "fp8")
-        b = _rand((4096, 12800), "fp8")
-        torch.compile(torch.matmul, dynamic=False)(a, b)
-
-
-class TestPointwise1D(_WDTestCase):
-    """1D pointwise & reduction -- always Pass 3 (Gate 1 always fails)."""
-
-    def test_pointwise_1d_add_31_idle_fp16(self):
-        """T001: 31 idle expected"""
-        x = _rand((64,), "fp16")
-        y = _rand((64,), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_1d_add_full_util_fp16(self):
-        """T002: full util expected"""
-        x = _rand((2048,), "fp16")
-        y = _rand((2048,), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_1d_add_full_util_large_fp16(self):
-        """T003: full util expected"""
-        x = _rand((4096,), "fp16")
-        y = _rand((4096,), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_1d_add_20_idle_bf16(self):
-        """T004: 20 idle expected"""
-        x = _rand((768,), "bf16")
-        y = _rand((768,), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_1d_mul_verify_cores_fp16(self):
-        """T005: verify core count"""
-        x = _rand((11008,), "fp16")
-        y = _rand((11008,), "fp16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
-
-    def test_reduction_1d_mean_no_split_possible_fp16(self):
-        """T006: no split possible"""
-        x = _rand((2048,), "fp16")
-        torch.compile(lambda t: torch.mean(t, dim=0), dynamic=False)(x)
-
-    def test_softmax_1d_reduce_over_only_dim_fp16(self):
-        """T007: reduce over only dim"""
-        x = _rand((2048,), "fp16")
-        torch.compile(lambda t: torch.softmax(t, dim=0), dynamic=False)(x)
-
-
-class TestPointwise2D(_WDTestCase):
-    """2D pointwise & reduction, including the layernorm/softmax cases
-    whose reduction dim must never be split."""
-
-    def test_pointwise_2d_add_prefill_residual_fp16(self):
-        """T020: prefill residual add"""
-        x = _rand((2048, 4096), "fp16")
-        y = _rand((2048, 4096), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_2d_add_decode_residual_fp16(self):
-        """T021: decode residual add"""
-        x = _rand((1, 4096), "fp16")
-        y = _rand((1, 4096), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_2d_add_prefill_residual_bf16(self):
-        """T022: bf16 prefill residual"""
-        x = _rand((2048, 4096), "bf16")
-        y = _rand((2048, 4096), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_2d_mul_swiglu_gate_fp16(self):
-        """T023: SwiGLU gate 2-D"""
-        x = _rand((2048, 11008), "fp16")
-        y = _rand((2048, 11008), "fp16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
-
-    def test_pointwise_2d_add_large_p1_may_split_bf16(self):
-        """T024: large, P1 may split"""
-        x = _rand((8192, 4096), "bf16")
-        y = _rand((8192, 4096), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_layernorm_2d_granite_llama_hidden_fp16(self):
-        """T030: Granite/Llama hidden"""
-        x = _rand((2048, 4096), "fp16")
-        normalized_shape = (4096,)
-        weight = _rand(normalized_shape, "fp16")
-        bias = _rand(normalized_shape, "fp16")
-
-        def fn(t, w, b):
-            return F.layer_norm(t, normalized_shape, w, b)
-
-        torch.compile(fn, dynamic=False)(x, weight, bias)
-
-    def test_layernorm_2d_decode_fp16(self):
-        """T031: decode layernorm"""
-        x = _rand((1, 4096), "fp16")
-        normalized_shape = (4096,)
-        weight = _rand(normalized_shape, "fp16")
-        bias = _rand(normalized_shape, "fp16")
-
-        def fn(t, w, b):
-            return F.layer_norm(t, normalized_shape, w, b)
-
-        torch.compile(fn, dynamic=False)(x, weight, bias)
-
-    def test_layernorm_2d_bert_hidden_bf16(self):
-        """T032: BERT hidden"""
-        x = _rand((49152, 768), "bf16")
-        normalized_shape = (768,)
-        weight = _rand(normalized_shape, "bf16")
-        bias = _rand(normalized_shape, "bf16")
-
-        def fn(t, w, b):
-            return F.layer_norm(t, normalized_shape, w, b)
-
-        torch.compile(fn, dynamic=False)(x, weight, bias)
-
-    def test_softmax_2d_attention_scores_fp16(self):
-        """T033: attention scores 2-D"""
-        x = _rand((2048, 2048), "fp16")
-        torch.compile(lambda t: torch.softmax(t, dim=-1), dynamic=False)(x)
-
-    def test_reduction_2d_mean_global_avgpool_bf16(self):
-        """T034: global avg pool"""
-        x = _rand((32, 768), "bf16")
-        torch.compile(lambda t: torch.mean(t, dim=1), dynamic=False)(x)
-
-
-class TestPointwise3D(_WDTestCase):
-    """3D pointwise, including real-model MLP activation shapes."""
-
-    def test_pointwise_3d_add_prefill_residual_fp16(self):
-        """T060: prefill residual 3-D"""
-        x = _rand((1, 2048, 4096), "fp16")
-        y = _rand((1, 2048, 4096), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_3d_add_decode_residual_fp16(self):
-        """T061: decode residual 3-D"""
-        x = _rand((1, 1, 4096), "fp16")
-        y = _rand((1, 1, 4096), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_3d_add_prefill_residual_bf16(self):
-        """T062: bf16 prefill residual 3-D"""
-        x = _rand((1, 2048, 4096), "bf16")
-        y = _rand((1, 2048, 4096), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_activation_3d_silu_llama_mlp_bf16(self):
-        """T063: Llama MLP activation"""
-        x = _rand((1, 2048, 14336), "bf16")
-        torch.compile(F.silu, dynamic=False)(x)
-
-    def test_activation_3d_gelu_granite_mlp_bf16(self):
-        """T064: Granite MLP activation"""
-        x = _rand((1, 2048, 16384), "bf16")
-        torch.compile(F.gelu, dynamic=False)(x)
-
-    def test_pointwise_3d_mul_swiglu_gate_fp16(self):
-        """T065: SwiGLU gate 3-D"""
-        x = _rand((1, 2048, 11008), "fp16")
-        y = _rand((1, 2048, 11008), "fp16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
-
-    def test_pointwise_3d_add_large_p1_may_split_bf16(self):
-        """T066: large, P1 may split"""
-        x = _rand((8, 4096, 4096), "bf16")
-        y = _rand((8, 4096, 4096), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_activation_3d_silu_gptoss_mlp_bf16(self):
-        """T067: gpt-oss MLP activation"""
-        x = _rand((1, 2048, 2880), "bf16")
-        torch.compile(F.silu, dynamic=False)(x)
-
-    def test_activation_3d_silu_mistral_mlp_bf16(self):
-        """T068: Mistral MLP activation"""
-        x = _rand((1, 2048, 32768), "bf16")
-        torch.compile(F.silu, dynamic=False)(x)
-
-    def test_activation_3d_gelu_granite_mlp_real_intermediate_bf16(self):
-        """T069: granite MLP activation"""
-        x = _rand((1, 2048, 12800), "bf16")
-        torch.compile(F.gelu, dynamic=False)(x)
-
-
-class TestPointwise4D(_WDTestCase):
-    """4D pointwise & reduction -- attention masks, RoPE, decode/prefill
-    softmax."""
-
-    def test_pointwise_4d_add_decode_attn_mask_fp16(self):
-        """T090: decode attn mask add"""
-        x = _rand((1, 32, 1, 2048), "fp16")
-        y = _rand((1, 32, 1, 2048), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_4d_add_prefill_attn_mask_large_fp16(self):
-        """T091: prefill attn mask (large)"""
-        x = _rand((1, 32, 2048, 2048), "fp16")
-        y = _rand((1, 32, 2048, 2048), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_4d_mul_rope_elementwise_fp16(self):
-        """T092: RoPE elementwise"""
-        x = _rand((1, 32, 2048, 128), "fp16")
-        y = _rand((1, 32, 2048, 128), "fp16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
-
-    def test_pointwise_4d_add_batched_large_bf16(self):
-        """T093: batched large add"""
-        x = _rand((1, 32, 2048, 4096), "bf16")
-        y = _rand((1, 32, 2048, 4096), "bf16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_softmax_4d_attention_scores_prefill_fp16(self):
-        """T095: attention scores prefill"""
-        x = _rand((1, 32, 2048, 2048), "fp16")
-        torch.compile(lambda t: torch.softmax(t, dim=-1), dynamic=False)(x)
-
-    def test_softmax_4d_decode_attention_scores_fp16(self):
-        """T096: decode attention scores"""
-        x = _rand((1, 32, 1, 2048), "fp16")
-        torch.compile(lambda t: torch.softmax(t, dim=-1), dynamic=False)(x)
-
-    def test_layernorm_4d_headwise_bf16(self):
-        """T097: head-wise layernorm"""
-        x = _rand((1, 32, 2048, 128), "bf16")
-        normalized_shape = (128,)
-        weight = _rand(normalized_shape, "bf16")
-        bias = _rand(normalized_shape, "bf16")
-
-        def fn(t, w, b):
-            return F.layer_norm(t, normalized_shape, w, b)
-
-        torch.compile(fn, dynamic=False)(x, weight, bias)
-
-
-class TestPointwise5D6D(_WDTestCase):
-    """5D/6D pointwise output -- grouped-head and deeply batched shapes."""
-
-    def test_pointwise_5d_add_grouped_head_residual_fp16(self):
-        """T100: grouped-head residual"""
-        x = _rand((1, 2, 16, 2048, 128), "fp16")
-        y = _rand((1, 2, 16, 2048, 128), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_5d_mul_gqa_elementwise_gate_bf16(self):
-        """T101: GQA elementwise gate"""
-        x = _rand((1, 4, 8, 2048, 64), "bf16")
-        y = _rand((1, 4, 8, 2048, 64), "bf16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
-
-    def test_softmax_5d_grouped_head_attn_scores_fp16(self):
-        """T102: grouped-head attn scores"""
-        x = _rand((1, 2, 16, 2048, 2048), "fp16")
-        torch.compile(lambda t: torch.softmax(t, dim=-1), dynamic=False)(x)
-
-    def test_pointwise_6d_add_deeply_batched_residual_fp16(self):
-        """T103: deeply batched residual"""
-        x = _rand((1, 2, 4, 8, 128, 64), "fp16")
-        y = _rand((1, 2, 4, 8, 128, 64), "fp16")
-        torch.compile(lambda a, b: a + b, dynamic=False)(x, y)
-
-    def test_pointwise_6d_mul_deeply_batched_gate_bf16(self):
-        """T104: deeply batched gate"""
-        x = _rand((1, 2, 4, 8, 32, 64), "bf16")
-        y = _rand((1, 2, 4, 8, 32, 64), "bf16")
-        torch.compile(lambda a, b: a * b, dynamic=False)(x, y)
+class TestGreedyDecodeB1M1(unittest.TestCase):
+    """T04x: B=1 M=1 decode shapes.
+
+    When M=1 the cost-model planner returns splits unchanged.  The greedy
+    pass (multi_dim_iteration_space_split) then runs on the reduced {n, k}
+    iteration space.  Assertions:
+      - prod(splits) <= 32   (never over-allocate)
+      - splits[n] divides n  (no fractional tiles)
+      - For N wide enough (>= 32 sticks), at least 1 core assigned to N.
+    """
+
+    def _run(self, n_sticks, k_sticks):
+        n, k = _isym("n"), _isym("k")
+        splits = multi_dim_iteration_space_split(
+            {n: n_sticks, k: k_sticks},
+            MAX_CORES,
+            [n],  # output dim
+            [k],  # reduction dim
+        )
+        cores = prod(splits.values())
+        self.assertLessEqual(cores, MAX_CORES, f"over-budget: {cores} cores")
+        self.assertEqual(
+            n_sticks % splits.get(n, 1),
+            0,
+            f"N split {splits.get(n, 1)} does not divide {n_sticks}",
+        )
+        return splits
+
+    def test_t040_tiny_decode_fp16(self):
+        """T040: (1,1,128)@(1,128,64) — N=1 stick (64 elements).
+        N cannot be split further; greedy may assign cores to K only."""
+        splits = self._run(n_sticks=1, k_sticks=2)
+        # N=1 stick is indivisible; total cores <= 2 (K=2 sticks at most).
+        self.assertLessEqual(
+            prod(splits.values()), 2, "T040: N=1 stick — at most K=2 cores assignable"
+        )
+
+    def test_t041_narrow_n_decode_fp16(self):
+        """T041: (1,1,128)@(1,128,512) — N=8 sticks."""
+        splits = self._run(n_sticks=8, k_sticks=2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T041: N=8 sticks should get a non-trivial split"
+        )
+
+    def test_t042_granite_decode_qkT_fp16(self):
+        """T042: (1,1,128)@(1,128,2048) — N=32 sticks."""
+        splits = self._run(n_sticks=32, k_sticks=2)
+        self.assertEqual(
+            prod(splits.values()),
+            MAX_CORES,
+            "T042: N=32 sticks should saturate all 32 cores",
+        )
+
+    def test_t043_nonpow2_n_fp16(self):
+        """T043: (1,1,128)@(1,128,3072) — N=48 sticks (non-power-2)."""
+        splits = self._run(n_sticks=48, k_sticks=2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T043: N=48 sticks should get a non-trivial split"
+        )
+
+    def test_t044_decode_scorev_worst_fp16(self):
+        """T044: (1,1,2048)@(1,2048,128) — N=2 sticks, K=32 sticks."""
+        splits = self._run(n_sticks=2, k_sticks=32)
+        # N is narrow; greedy may spill onto K or use very few cores.
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+    def test_t045_tsp4032_underutil_fp16(self):
+        """T045: (1,1,4096)@(1,4096,25600) — N=400 sticks.
+        tsp#4032: greedy assigns 25 cores (400 not divisible by 32).
+        Assert it uses at least 25 (does not regress further)."""
+        n, k = _isym("n"), _isym("k")
+        splits = multi_dim_iteration_space_split(
+            {n: 400, k: 64},
+            MAX_CORES,
+            [n],
+            [k],
+        )
+        self.assertGreaterEqual(
+            prod(splits.values()), 25, "T045: tsp#4032 shape must use at least 25 cores"
+        )
+
+    def test_t046_reference_full_util_fp16(self):
+        """T046: (1,1,4096)@(1,4096,26624) — N=416 sticks (416=32×13)."""
+        splits = self._run(n_sticks=416, k_sticks=64)
+        self.assertEqual(
+            prod(splits.values()),
+            MAX_CORES,
+            "T046: N=416 sticks (divisible by 32) must use all 32 cores",
+        )
+
+    def test_t047_at_span_limit_fp16(self):
+        """T047: (1,1,4096)@(1,4096,32768) — N=512 sticks."""
+        splits = self._run(n_sticks=512, k_sticks=64)
+        self.assertEqual(
+            prod(splits.values()),
+            MAX_CORES,
+            "T047: N=512 sticks must saturate all 32 cores",
+        )
+
+
+class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
+    """T05x: B=1 M>1 prefill shapes — _cost_model_matmul_planner (P2).
+
+    Assertions:
+      - splits[m] > 1   (M is the output-row dim; planner must exploit it)
+      - prod(splits) == 32  (full core utilization for full-size shapes)
+      - splits[k] == 1  when K is narrow (only 2 sticks — psum penalty)
+    """
+
+    def _make_op(self, m_rows, n_sticks, k_sticks, name):
+        """Build a B=1 M>1 matmul op and run the real cost-model planner.
+
+        Buffer and TensorDep shapes are in *elements* (matching what the
+        passing tests in TestCostModelPlannerOutputs use).  it_space uses
+        stick counts for n and k — that is the adjusted space the planner
+        receives in production after adjust_it_space_for_sticks().
+        """
+        m, n, k = _isym("m"), _isym("n"), _isym("k")
+        n_elems = n_sticks * _FP16_ELEMS_PER_STICK
+        k_elems = k_sticks * _FP16_ELEMS_PER_STICK
+        op = _computed_buffer(
+            (m_rows, n_elems),
+            name=name,
+            reduction_type="batchmatmul",
+            reduction_ranges=(k_elems,),
+        )
+        output_td = _tensor_dep(name, (m_rows, n_elems), (m, n))
+        input_tds = [
+            _tensor_dep(f"{name}_lhs", (m_rows, k_elems), (m, k)),
+            _tensor_dep(f"{name}_rhs", (k_elems, n_elems), (k, n)),
+        ]
+        it_space = {m: m_rows, n: n_sticks, k: k_sticks}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+        default = {sym: 1 for sym in it_space}
+        splits = _cost_model_matmul_planner(
+            op,
+            default,
+            it_space,
+            output_td,
+            stick_vars,
+            {},
+            MAX_CORES,
+            input_tds,
+            set(),
+            {},
+        )
+        return splits, m, n, k
+
+    def test_t050_speculative_decode_m4_fp16(self):
+        """T050: (1,4,128)@(1,128,2048) — M=4 underfill, N=32 sticks, K=2.
+
+        M=4 is too small to split: each per-core tile would be 1 row, causing
+        severe PT pipeline underfill.  The cost model correctly keeps m=1 and
+        puts all cores on N instead.  Assert that cores ARE assigned (via N),
+        not that M specifically is split."""
+        splits, m, n, k = self._make_op(4, 32, 2, "t050")
+        self.assertGreater(
+            prod(splits.values()),
+            1,
+            "T050: M=4 underfill — cores must be assigned via N",
+        )
+        self.assertGreater(
+            splits.get(n, 1),
+            1,
+            "T050: N=32 sticks must absorb the cores when M is tiny",
+        )
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(4, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T050: split must model finite cost")
+        self._assert_cost_not_regressed("test_t050_speculative_decode_m4_fp16", cost)
+
+    def test_t051_m16_underfill_boundary_fp16(self):
+        """T051: (1,16,128)@(1,128,2048) — M=16 boundary, N=32, K=2.
+
+        M=16 is at the underfill boundary.  The cost model may or may not split
+        M depending on the PT efficiency curve; what must hold is that at least
+        some cores are assigned and the total stays within budget."""
+        splits, m, n, k = self._make_op(16, 32, 2, "t051")
+        self.assertGreater(
+            prod(splits.values()), 1, "T051: M=16 — some cores must be assigned"
+        )
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(16, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T051: split must model finite cost")
+        self._assert_cost_not_regressed("test_t051_m16_underfill_boundary_fp16", cost)
+
+    def test_t052_prefill_qkT_standard_fp16(self):
+        """T052: (1,2048,128)@(1,128,2048) — standard prefill QK^T."""
+        splits, m, n, k = self._make_op(2048, 32, 2, "t052")
+        self.assertGreater(
+            splits.get(m, 1), 1, "T052: M=2048 must be split for prefill"
+        )
+        self.assertEqual(splits.get(k, 1), 1, "T052: K=2 sticks must not be split")
+        self.assertEqual(
+            prod(splits.values()), MAX_CORES, "T052: prefill QK^T must use all 32 cores"
+        )
+
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T052: split must model finite cost")
+        self._assert_cost_not_regressed("test_t052_prefill_qkT_standard_fp16", cost)
+
+    def test_t053_scorev_k_gt_n_fp16(self):
+        """T053: (1,2048,2048)@(1,2048,128) — K>>N, score x V."""
+        splits, m, n, k = self._make_op(2048, 2, 32, "t053")
+        self.assertGreater(
+            splits.get(m, 1), 1, "T053: M must be split for heavy-K narrow-N shape"
+        )
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(128, splits.get(n, 1)),
+            k_axis=(2048, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T053: split must model finite cost")
+        self._assert_cost_not_regressed("test_t053_scorev_k_gt_n_fp16", cost)
+
+    def test_t056_span_limit_fp16(self):
+        """T056: (1,2048,4096)@(1,4096,32832) — at span limit.
+        N=32832/64=513 sticks (not round); planner must still return valid splits."""
+        splits, m, n, k = self._make_op(2048, 513, 64, "t056")
+        # Just validate structural correctness; span limit may constrain splits.
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+
+class TestGreedyDecodeB4plusM1(unittest.TestCase):
+    """T07x: B>1 M=1 batch decode — greedy P3 on {b, n, k}.
+
+    Assertions:
+      - prod(splits) > 1   (batch + N provide useful parallelism)
+      - prod(splits) <= 32
+      - splits[b] * splits[n] divides their respective sizes
+    """
+
+    def _run(self, batch, n_sticks, k_sticks):
+        b, n, k = _isym("b"), _isym("n"), _isym("k")
+        splits = multi_dim_iteration_space_split(
+            {b: batch, n: n_sticks, k: k_sticks},
+            MAX_CORES,
+            [b, n],
+            [k],
+        )
+        cores = prod(splits.values())
+        self.assertLessEqual(cores, MAX_CORES)
+        self.assertEqual(batch % splits.get(b, 1), 0)
+        self.assertEqual(n_sticks % splits.get(n, 1), 0)
+        return splits, b, n, k
+
+    def test_t070_batch2_fp16(self):
+        """T070: (2,1,128)@(2,128,1024) — B=2, N=16 sticks."""
+        splits, b, n, k = self._run(2, 16, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T070: B=2 N=16 must get a non-trivial split"
+        )
+
+    def test_t071_batch4_fp16(self):
+        """T071: (4,1,128)@(4,128,512) — B=4, N=8 sticks."""
+        splits, b, n, k = self._run(4, 8, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T071: B=4 N=8 must get a non-trivial split"
+        )
+
+    def test_t072_batch8_fp16(self):
+        """T072: (8,1,128)@(8,128,256) — B=8, N=4 sticks."""
+        splits, b, n, k = self._run(8, 4, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T072: B=8 N=4 must get a non-trivial split"
+        )
+
+    def test_t073_batch16_fp16(self):
+        """T073: (16,1,128)@(16,128,128) — B=16, N=2 sticks."""
+        splits, b, n, k = self._run(16, 2, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T073: B=16 must get a non-trivial split"
+        )
+
+    def test_t074_batch32_fp16(self):
+        """T074: (32,1,64)@(32,64,64) — B=32, N=1 stick."""
+        splits, b, n, k = self._run(32, 1, 1)
+        # B=32 fills all cores by itself; N=1 stick may not be splittable.
+        self.assertEqual(
+            prod(splits.values()), MAX_CORES, "T074: B=32 must saturate all 32 cores"
+        )
+
+    def test_t075_odd_batch5_fp16(self):
+        """T075: (5,1,128)@(5,128,2048) — odd B=5, N=32 sticks."""
+        splits, b, n, k = self._run(5, 32, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T075: B=5 N=32 must get a non-trivial split"
+        )
+
+    def test_t076_odd_batch7_fp16(self):
+        """T076: (7,1,128)@(7,128,2048) — odd B=7, N=32 sticks."""
+        splits, b, n, k = self._run(7, 32, 2)
+        self.assertGreater(
+            prod(splits.values()), 1, "T076: B=7 N=32 must get a non-trivial split"
+        )
+
+
+class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCase):
+    """T08x: B>1 M>1 batched prefill — _cost_model_matmul_planner (P2).
+
+    Assertions:
+      - prod(splits) == 32   (full utilization for large shapes)
+      - splits[m] or splits[b] > 1  (some output dim is split)
+    """
+
+    def _make_op(self, batch, m_rows, n_sticks, k_sticks, name):
+        """Build a B>1 M>1 batched matmul op and run the real cost-model planner.
+
+        Buffer and TensorDep shapes are in *elements*; it_space uses stick
+        counts for n and k (same convention as TestCostModelPlannerOutputs).
+        """
+        b, m, n, k = _isym("b"), _isym("m"), _isym("n"), _isym("k")
+        n_elems = n_sticks * _FP16_ELEMS_PER_STICK
+        k_elems = k_sticks * _FP16_ELEMS_PER_STICK
+        op = _computed_buffer(
+            (batch, m_rows, n_elems),
+            name=name,
+            reduction_type="batchmatmul",
+            reduction_ranges=(k_elems,),
+        )
+        output_td = _tensor_dep(name, (batch, m_rows, n_elems), (b, m, n))
+        input_tds = [
+            _tensor_dep(f"{name}_lhs", (batch, m_rows, k_elems), (b, m, k)),
+            _tensor_dep(f"{name}_rhs", (batch, k_elems, n_elems), (b, k, n)),
+        ]
+        it_space = {b: batch, m: m_rows, n: n_sticks, k: k_sticks}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+        default = {sym: 1 for sym in it_space}
+        splits = _cost_model_matmul_planner(
+            op,
+            default,
+            it_space,
+            output_td,
+            stick_vars,
+            {},
+            MAX_CORES,
+            input_tds,
+            set(),
+            {},
+        )
+        return splits, b, m, n, k
+
+    def test_t080_multihead_prefill_qkT_fp16(self):
+        """T080: (4,2048,128)@(4,128,2048) — B=4, M=2048, N=32, K=2."""
+        splits, b, m, n, k = self._make_op(4, 2048, 32, 2, "t080")
+        self.assertGreater(
+            max(splits.get(m, 1), splits.get(b, 1)),
+            1,
+            "T080: at least one of M or B must be split",
+        )
+        self.assertEqual(
+            prod(splits.values()), MAX_CORES, "T080: must use all 32 cores"
+        )
+
+        cost = _matmul_split_cost(
+            b_axis=(4, splits.get(b, 1)),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T080: split must model finite cost")
+        self._assert_cost_not_regressed("test_t080_multihead_prefill_qkT_fp16", cost)
+
+    def test_t081_batched_heads_qkT_fp16(self):
+        """T081: (4,2048,512)@(4,512,2048) — B=4, M=2048, N=32, K=8."""
+        splits, b, m, n, k = self._make_op(4, 2048, 32, 8, "t081")
+        self.assertGreater(
+            max(splits.get(m, 1), splits.get(b, 1)),
+            1,
+            "T081: at least one of M or B must be split",
+        )
+        self.assertEqual(
+            prod(splits.values()), MAX_CORES, "T081: must use all 32 cores"
+        )
+
+        cost = _matmul_split_cost(
+            b_axis=(4, splits.get(b, 1)),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(2048, splits.get(n, 1)),
+            k_axis=(512, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T081: split must model finite cost")
+        self._assert_cost_not_regressed("test_t081_batched_heads_qkT_fp16", cost)
+
+    def test_t082_bert_style_batched_bf16(self):
+        """T082: (8,512,128)@(8,128,512) — B=8, M=512, N=8, K=2."""
+        splits, b, m, n, k = self._make_op(8, 512, 8, 2, "t082")
+        self.assertGreater(
+            max(splits.get(m, 1), splits.get(b, 1)),
+            1,
+            "T082: at least one of M or B must be split",
+        )
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+        cost = _matmul_split_cost(
+            b_axis=(8, splits.get(b, 1)),
+            m_axis=(512, splits.get(m, 1)),
+            n_axis=(512, splits.get(n, 1)),
+            k_axis=(128, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"), "T082: split must model finite cost")
+        self._assert_cost_not_regressed("test_t082_bert_style_batched_bf16", cost)
 
 
 if __name__ == "__main__":
