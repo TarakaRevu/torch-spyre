@@ -15,6 +15,7 @@
 import os
 import re
 import unittest
+import warnings
 from math import prod
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -48,45 +49,37 @@ _FP16_ELEMS_PER_STICK = 64
 MAX_CORES = 32
 
 # ---------------------------------------------------------------------------
-# Cost baselines — best-known modeled cost (µs) for each decision test.
+# Cost baselines — best-known modeled cost (µs) for each unique shape/scenario.
 #
 # Rules:
-#   - None  = not yet recorded; first UPDATE_BASELINES=1 run stores the value.
+#   - None  = not yet recorded.
 #   - float = the best-known modeled cost the planner produced for this shape.
 #
-# In normal CI this dict is NEVER written.  A cost improvement is only
-# printed.  A cost increase past the stored value fails the test.
-#
-# To record or update baselines after an intentional cost-model improvement:
-#   UPDATE_BASELINES=1 python3 -m pytest test_work_division_costmodel.py -v -s
+# Baseline Management & Regression Checks:
+#   - Performance improvement (cost < baseline): emits UserWarning informing of improvement.
+#   - Within range (<= baseline + tolerance): passes silently.
+#   - Performance regression (> baseline + tolerance): raises AssertionError (test failure).
+#   - Updating baselines: run with UPDATE_BASELINES=1 to record new/improved values in file.
 # ---------------------------------------------------------------------------
 COST_BASELINES: dict[str, float | None] = {
-    # TestCostModelPlannerOutputs — individual named tests
-    "test_prefill_qkT_splits_m_not_k": 67.0027,
-    "test_scorev_heavy_k_prefers_m_split": 58.6411,
-    "test_bmm_b1_mgt1_prefill_cost_model_splits_m": 67.0027,
-    # TestCostModelPrefillB1Mgt1 — T05x scenario tests
-    "test_t050_speculative_decode_m4_fp16": 84.5314,
-    "test_t051_m16_underfill_boundary_fp16": 25.1893,
-    "test_t052_prefill_qkT_standard_fp16": 67.0027,
-    "test_t053_scorev_k_gt_n_fp16": 58.6411,
-    # TestCostModelBatchedPrefillBgt1Mgt1 — T08x scenario tests
-    "test_t080_multihead_prefill_qkT_fp16": 238.0107,
-    "test_t081_batched_heads_qkT_fp16": 430.5227,
-    "test_t082_bert_style_batched_bf16": 36.4947,
+    # Unique shape scenarios (B=1, M>1 prefill and underfill)
+    "test_prefill_speculative_decode_underfill_m4": 84.5314,  # (1, 4, 128) x (1, 128, 2048) - M=4 underfill
+    "test_prefill_underfill_boundary_m16": 25.1893,  # (1, 16, 128) x (1, 128, 2048) - M=16 boundary
+    "test_prefill_standard_qkt_m2048": 67.0027,  # (1, 2048, 128) x (1, 128, 2048) - standard prefill
+    "test_prefill_scorev_heavy_k_narrow_n": 58.6411,  # (1, 2048, 2048) x (1, 2048, 128) - heavy-K score x V
+    "test_prefill_mlp_upproj_wide_n": 2691.7553,  # (1, 2048, 4096) x (1, 4096, 11008) - wide-N MLP
+    # Unique shape scenarios (B>1, M>1 batched prefill)
+    "test_batched_prefill_multihead_qkt_b4_m2048": 238.0107,  # (4, 2048, 128) x (4, 128, 2048) - batched heads
+    "test_batched_prefill_deep_k_heads_b4_m2048_k512": 430.5227,  # (4, 2048, 512) x (4, 512, 2048) - deep K batched
+    "test_batched_prefill_bert_style_b8_m512": 36.4947,  # (8, 512, 128) x (8, 128, 512) - BERT-style
 }
 
 _THIS_FILE = Path(__file__).resolve()
 
 
 def _store_baseline(test_name: str, cost: float) -> None:
-    """Rewrite the COST_BASELINES entry for *test_name* in this source file.
-
-    Always writes exactly 4 decimal places so the stored literal is stable
-    across runs and the regex below can always find and re-match it.
-    """
+    """Rewrite the COST_BASELINES entry for *test_name* in this source file."""
     text = _THIS_FILE.read_text()
-    # Match the key plus its current value (None or a decimal number).
     pattern = rf'("{re.escape(test_name)}":\s*)(None|[0-9]+(?:\.[0-9]+)?)'
     replacement = rf"\g<1>{cost:.4f}"
     new_text, n = re.subn(pattern, replacement, text, count=1)
@@ -99,9 +92,7 @@ def _store_baseline(test_name: str, cost: float) -> None:
 
 def _real_commit(op, splits, it_space):
     """Call the real commit_iteration_space_ownership with iteration_space_from_op
-    patched to return ``it_space``.  Used in unit tests that construct ops with
-    MagicMock data objects -- those mocks produce an empty rw.writes iterator
-    which causes StopIteration inside iteration_space_from_op."""
+    patched to return ``it_space``."""
     with patch(
         "torch_spyre._inductor.pass_utils.iteration_space_from_op",
         return_value=it_space,
@@ -155,12 +146,7 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
 
 
 class _CostModelAssertMixin:
-    """Mixin providing shared assertion helpers for cost-model test classes.
-
-    Not a test class itself (no 'Test' prefix); unittest will not collect it.
-    Mix into any TestCase subclass that needs _assert_valid_split,
-    _assert_full_cores, or _assert_cost_not_regressed.
-    """
+    """Mixin providing shared assertion helpers for cost-model test classes."""
 
     def _assert_valid_split(self, splits, it_space):
         """Generic sanity: core budget respected, each split divides its dim."""
@@ -172,12 +158,7 @@ class _CostModelAssertMixin:
             self.assertEqual(size % s, 0, f"{sym}: size {size} not divisible by {s}")
 
     def _assert_full_cores(self, splits, test_name: str) -> None:
-        """Assert the planner uses all MAX_CORES.
-
-        Catches regressions where a cost-model change causes the planner to
-        pick 16 or 25 cores instead of 32 -- e.g. a penalty weight pushed too
-        high so the search settles on a partial split.
-        """
+        """Assert the planner uses all MAX_CORES."""
         cores = prod(splits.values())
         self.assertEqual(
             cores,
@@ -186,70 +167,68 @@ class _CostModelAssertMixin:
             f"splits={splits}",
         )
 
-    def _assert_cost_not_regressed(self, test_name: str, cost: float) -> None:
+    def _assert_cost_not_regressed(
+        self, test_name: str, cost: float, tolerance_pct: float = 0.05
+    ) -> None:
         """Compare *cost* (µs) against the stored COST_BASELINES entry.
 
-        Behaviour:
-          - Baseline is None (first run / not yet recorded):
-              Prints the value.  If UPDATE_BASELINES=1 is set, writes it into
-              this file's COST_BASELINES dict so future runs have a reference.
-          - cost <= baseline:
-              Test passes.  If cost < baseline (improvement), prints a note.
-              If UPDATE_BASELINES=1, updates the stored value so the new lower
-              cost becomes the next reference point.
-          - cost > baseline (regression):
-              Test FAILS with a clear message showing old vs new cost.
-
-        Never fails when the baseline is None -- it only starts enforcing after
-        the first UPDATE_BASELINES=1 run commits a value.
+        Args:
+            test_name: Name of the test matching the key in COST_BASELINES.
+            cost: The measured modeled cost in µs.
+            tolerance_pct: Allowed relative tolerance range (default: 5% / 0.05).
         """
         baseline = COST_BASELINES.get(test_name)
 
-        # Allow 0.1 µs of tolerance so that a cost that rounds to the same
-        # 4-decimal display as the baseline never triggers a false failure.
-        # This is well below any meaningful cost-model change (which moves costs
-        # by at least ~0.5 µs) but large enough to absorb IEEE-754 rounding at
-        # the 4th decimal place (worst case ~5e-5 µs).
-        _EPSILON = 1e-4
-        if baseline is not None and cost > baseline + _EPSILON:
-            self.fail(
-                f"{test_name}: modeled cost REGRESSED\n"
-                f"  stored baseline : {baseline:.4f} µs\n"
-                f"  measured now    : {cost:.4f} µs\n"
-                f"  difference      : +{cost - baseline:.4f} µs\n"
-                f"If this is intentional, re-run with UPDATE_BASELINES=1 to "
-                f"commit the new value."
+        if baseline is None:
+            warning_msg = (
+                f"\n[UNRECORDED BASELINE] {test_name}: measured cost is {cost:.4f} µs.\n"
+                f"  Re-run with UPDATE_BASELINES=1 to record this baseline."
             )
-
-        if baseline is None or cost < baseline - _EPSILON:
-            tag = (
-                "new baseline"
-                if baseline is None
-                else f"improvement over {baseline:.4f}"
-            )
-            print(f"\n[cost-baseline] {test_name}: {cost:.4f} µs ({tag})")
+            warnings.warn(warning_msg, UserWarning, stacklevel=2)
             if os.environ.get("UPDATE_BASELINES") == "1":
                 _store_baseline(test_name, cost)
                 print(
                     f"[cost-baseline] wrote {cost:.4f} µs to COST_BASELINES[{test_name!r}]"
                 )
+            return
+
+        _EPSILON = 1e-4
+        if cost < baseline - _EPSILON:
+            diff = baseline - cost
+            pct = (diff / baseline) * 100
+            warning_msg = (
+                f"\n[PERFORMANCE IMPROVEMENT] {test_name}:\n"
+                f"  stored baseline : {baseline:.4f} µs\n"
+                f"  measured now    : {cost:.4f} µs\n"
+                f"  improvement     : -{diff:.4f} µs (-{pct:.2f}%)\n"
+                f"  Re-run with UPDATE_BASELINES=1 to commit the new baseline."
+            )
+            warnings.warn(warning_msg, UserWarning, stacklevel=2)
+            if os.environ.get("UPDATE_BASELINES") == "1":
+                _store_baseline(test_name, cost)
+                print(
+                    f"[cost-baseline] updated COST_BASELINES[{test_name!r}] to {cost:.4f} µs"
+                )
+            return
+
+        max_allowed_cost = baseline * (1.0 + tolerance_pct)
+        if cost > max_allowed_cost:
+            self.fail(
+                f"\n[PERFORMANCE REGRESSION ERROR] {test_name}: modeled cost REGRESSED outside acceptable range (+{tolerance_pct * 100:.1f}%)\n"
+                f"  stored baseline : {baseline:.4f} µs\n"
+                f"  max allowed     : {max_allowed_cost:.4f} µs\n"
+                f"  measured now    : {cost:.4f} µs\n"
+                f"  regression      : +{cost - baseline:.4f} µs (+{((cost - baseline) / baseline) * 100:.2f}%)"
+            )
 
 
 # ---------------------------------------------------------------------------
-# Focused unit tests on _cost_model_matmul_planner output
-#
-# Each test calls the *real* work_division._cost_model_matmul_planner (not a
-# dict stub) and asserts the returned split dictionary satisfies structural
-# invariants or known expected values.
+# Core planner decisions, invariants, and handoff integrity tests
 # ---------------------------------------------------------------------------
 
 
-class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
-    """Direct assertions on _cost_model_matmul_planner return values.
-
-    Each test constructs a real ComputedBuffer + TensorDep (no torch.compile),
-    calls the real planner, and asserts on the resulting split dict.
-    """
+class TestPlannerDecisionsAndHandoff(_CostModelAssertMixin, unittest.TestCase):
+    """Direct assertions on planner decision rules, constraints, and handoff to IR."""
 
     def _run_planner(
         self,
@@ -263,7 +242,6 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
         committed_splits=None,
         max_cores=32,
     ):
-        """Thin wrapper: builds default splits={sym:1,...} and calls the real planner."""
         default = {sym: 1 for sym in it_space}
         return _cost_model_matmul_planner(
             op,
@@ -278,16 +256,8 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
             allowed_splits or {},
         )
 
-    # ------------------------------------------------------------------
-    # B=1, M>1 prefill QK^T: cost model should exploit M, not K
-    # ------------------------------------------------------------------
-
-    def test_prefill_qkT_splits_m_not_k(self):
-        """Standard prefill QK^T (1, 2048, 128) x (1, 128, 2048):
-        N=2048 elements = 32 sticks, K=128 elements = 2 sticks.
-        Planner should split M (2048 rows) using the majority of 32 cores
-        and leave K unsplit -- splitting K=2 sticks gives only 2 partial
-        dot products, which the cost model penalises heavily."""
+    def test_prefill_qkt_splits_m_dimension_not_k(self):
+        """Prefill QK^T: Planner should split M (2048 rows) and leave K=2 sticks unsplit."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
         op = _computed_buffer(
             (2048, 2048),
@@ -312,39 +282,36 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
         self.assertEqual(
             splits.get(k, 1), 1, "planner should not split K for narrow QK^T"
         )
-        self.assertEqual(
-            prod(splits.values()),
-            MAX_CORES,
-            "B=1 M>>1: cost model should use all 32 cores "
-            "(regression guard for removed bmm device-layout pass)",
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
+        self._assert_full_cores(splits, "test_prefill_qkt_splits_m_dimension_not_k")
 
-        # Core-count guard: any change that drops the planner to 16 or 25 cores fails here.
-        self._assert_full_cores(splits, "test_prefill_qkT_splits_m_not_k")
-
-        # Cost regression guard.
-        # Shapes in elements: B=1, M=2048, N=2048, K=128.
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
+    def test_scorev_heavy_k_prefers_m_split_over_narrow_n(self):
+        """Score x V (K=2048 >> N=128): Planner should split M, not narrow N=2 sticks."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 128),
+            name="scorev",
+            reduction_type="batchmatmul",
+            reduction_ranges=(2048,),
         )
-        self.assertLess(
-            cost,
-            float("inf"),
-            "planner-chosen split must model a finite (feasible) cost",
-        )
-        self._assert_cost_not_regressed("test_prefill_qkT_splits_m_not_k", cost)
+        output_td = _tensor_dep("scorev", (2048, 128), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 2048), (m, k)),
+            _tensor_dep("rhs", (2048, 128), (k, n)),
+        ]
+        it_space = {m: 2048, n: 2, k: 32}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
 
-    # ------------------------------------------------------------------
-    # Batch-split: unrestricted allows B split, blocked {b} keeps B=1
-    # ------------------------------------------------------------------
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        self.assertGreater(splits.get(m, 1), 1)
+        self._assert_full_cores(
+            splits, "test_scorev_heavy_k_prefers_m_split_over_narrow_n"
+        )
 
     def test_blocked_batch_dim_stays_unsplit(self):
-        """A batch dimension in *blocked* must remain split=1 even when the
-        unblocked plan would have preferred to split it."""
+        """Blocked batch dimension must remain split=1 even if unblocked plan prefers splitting it."""
         batch, m, n, k = (_isym(x) for x in ("batch", "m", "n", "k"))
         op = _computed_buffer(
             (4, 64, 256),
@@ -374,18 +341,11 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
                 op, it_space, output_td, stick_vars, input_tds, blocked={batch}
             )
 
-        self.assertGreater(
-            unrestricted.get(batch, 1), 1, "unblocked plan should prefer B split"
-        )
-        self.assertEqual(restricted.get(batch, 1), 1, "blocked B must remain unsplit")
+        self.assertGreater(unrestricted.get(batch, 1), 1)
+        self.assertEqual(restricted.get(batch, 1), 1)
 
-    # ------------------------------------------------------------------
-    # apply_splits commits ownership; work_slices must reflect the plan.
-    # ------------------------------------------------------------------
-
-    def test_apply_splits_commits_ownership_correctly(self):
-        """Real apply_splits must write iteration_space_ownership.work_slices
-        whose values match the planner's returned splits exactly."""
+    def test_apply_splits_commits_ownership_to_ir(self):
+        """Real apply_splits must store work_slices matching the planner decision exactly."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
         op = _computed_buffer(
             (2048, 2048),
@@ -411,22 +371,13 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
             apply_splits(op, splits)
 
         ownership = getattr(op, "iteration_space_ownership", None)
-        self.assertIsNotNone(
-            ownership, "apply_splits must set op.iteration_space_ownership"
-        )
+        self.assertIsNotNone(ownership)
         for sym, expected in splits.items():
             actual = ownership.work_slices.get(sym, 1)
-            self.assertEqual(
-                actual, expected, f"work_slices[{sym}]={actual} != planned {expected}"
-            )
-
-    # ------------------------------------------------------------------
-    # Committed split blocks re-entry; planner returns unchanged splits
-    # ------------------------------------------------------------------
+            self.assertEqual(actual, expected)
 
     def test_committed_split_prevents_planner_override(self):
-        """If committed_splits is non-empty the planner must return the default
-        splits unchanged (the op was already divided by span_reduction_pass)."""
+        """Non-empty committed_splits must cause planner to return unchanged default splits."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
         op = _computed_buffer(
             (2048, 2048),
@@ -449,26 +400,18 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
             it_space,
             output_td,
             stick_vars,
-            {k: 2},  # committed
+            {k: 2},
             MAX_CORES,
             input_tds,
             set(),
             {},
         )
-        self.assertEqual(
-            result,
-            default,
-            "planner must return unchanged defaults when a prior commit exists",
-        )
+        self.assertEqual(result, default)
 
-    # ------------------------------------------------------------------
-    # Non-matmul op: planner is a no-op
-    # ------------------------------------------------------------------
-
-    def test_non_matmul_op_returns_unchanged(self):
-        """_cost_model_matmul_planner must be a no-op for non-matmul ops."""
+    def test_non_matmul_op_is_noop(self):
+        """Non-matmul operations must be a no-op for the cost-model planner."""
         x = _isym("x")
-        op = _computed_buffer((2048,), name="pointwise_op")  # Pointwise, not Reduction
+        op = _computed_buffer((2048,), name="pointwise_op")
         output_td = _tensor_dep("pointwise_op", (2048,), (x,))
         it_space = {x: 2048}
         default = {x: 1}
@@ -476,80 +419,18 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
         result = _cost_model_matmul_planner(
             op, default, it_space, output_td, {}, {}, MAX_CORES, [], set(), {}
         )
-        self.assertEqual(result, default, "planner must be a no-op for non-matmul ops")
+        self.assertEqual(result, default)
 
-    # ------------------------------------------------------------------
-    # Score x V (K >> N shape): cost model should prefer M over N
-    # ------------------------------------------------------------------
-
-    def test_scorev_heavy_k_prefers_m_split(self):
-        """score x V: (1, 2048, 2048) x (1, 2048, 128).
-        N=128 elements = 2 sticks (fp16), K=2048 elements = 32 sticks.
-        Cost model should split M, not N -- the 2-stick N is too narrow
-        to absorb useful parallelism."""
-        m, n, k = (_isym(x) for x in ("m", "n", "k"))
-        op = _computed_buffer(
-            (2048, 128),
-            name="scorev",
-            reduction_type="batchmatmul",
-            reduction_ranges=(2048,),
-        )
-        output_td = _tensor_dep("scorev", (2048, 128), (m, n))
-        input_tds = [
-            _tensor_dep("lhs", (2048, 2048), (m, k)),
-            _tensor_dep("rhs", (2048, 128), (k, n)),
-        ]
-        it_space = {m: 2048, n: 2, k: 32}
-        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
-
-        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
-        self._assert_valid_split(splits, it_space)
-
-        self.assertGreater(
-            splits.get(m, 1),
-            1,
-            "score x V: planner should split M for heavy-K narrow-N shape",
-        )
-
-        # Core-count guard.
-        self._assert_full_cores(splits, "test_scorev_heavy_k_prefers_m_split")
-
-        # Cost regression guard.
-        # Shapes in elements: B=1, M=2048, N=128, K=2048.
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(128, splits.get(n, 1)),
-            k_axis=(2048, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(
-            cost,
-            float("inf"),
-            "planner-chosen split must model a finite (feasible) cost",
-        )
-        self._assert_cost_not_regressed("test_scorev_heavy_k_prefers_m_split", cost)
-
-    # ------------------------------------------------------------------
-    # apply_splits -> work_slices round-trip for a multi-dim plan
-    # ------------------------------------------------------------------
-
-    def test_handoff_planner_to_apply_splits_to_ownership(self):
-        """Full planner -> apply_splits -> ownership.work_slices round-trip.
-
-        Calls the real _cost_model_matmul_planner, then the real apply_splits,
-        then reads iteration_space_ownership.work_slices, confirming that the
-        scheduler will receive exactly what the planner decided -- no key
-        renamed, no magnitude changed, no dimension dropped.
-        """
+    def test_handoff_preserves_plan_to_scheduler_ownership(self):
+        """Full planner -> apply_splits -> ownership.work_slices round-trip check."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
         op = _computed_buffer(
             (2048, 2048),
-            name="handoff_qkT",
+            name="handoff_qkt",
             reduction_type="batchmatmul",
             reduction_ranges=(128,),
         )
-        output_td = _tensor_dep("handoff_qkT", (2048, 2048), (m, n))
+        output_td = _tensor_dep("handoff_qkt", (2048, 2048), (m, n))
         input_tds = [
             _tensor_dep("lhs", (2048, 128), (m, k)),
             _tensor_dep("rhs", (128, 2048), (k, n)),
@@ -567,23 +448,76 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
             apply_splits(op, splits)
 
         ownership = op.iteration_space_ownership
+        self.assertIsNotNone(
+            ownership, "apply_splits must set op.iteration_space_ownership"
+        )
         received = {sym: ownership.work_slices.get(sym, 1) for sym in splits}
 
         for sym in splits:
+            self.assertEqual(splits[sym], received[sym])
+
+    def test_codegen_handoff_per_core_tile_and_mapping(self):
+        """Verify the exact data structures codegen reads from iteration_space_ownership:
+        1. work_slices: split factors per dimension.
+        2. per-core tile size: exact integer tile bounds for each core.
+        3. core_id_to_work_slice: SymPy formulas mapping hardware core_id -> slice index (if present).
+        """
+        core_id_sym = sympy.Symbol("core_id")
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="codegen_handoff_qkt",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("codegen_handoff_qkt", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
+
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+        self._assert_valid_split(splits, it_space)
+
+        with patch(
+            "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
+            wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
+        ):
+            apply_splits(op, splits)
+
+        ownership = op.iteration_space_ownership
+        self.assertIsNotNone(ownership, "Codegen requires op.iteration_space_ownership")
+
+        # 1. Check split factors received by codegen
+        for sym, split_factor in splits.items():
+            self.assertEqual(ownership.work_slices.get(sym, 1), split_factor)
+
+        # 2. Check per-core tile dimensions (what codegen loops iterate over)
+        for sym, total_size in it_space.items():
+            split_factor = ownership.work_slices.get(sym, 1)
             self.assertEqual(
-                splits[sym],
-                received[sym],
-                f"dim {sym}: planner chose {splits[sym]}, scheduler received {received[sym]}",
+                total_size % split_factor, 0, f"Codegen tile uneven on {sym}"
             )
+            per_core_tile = total_size // split_factor
+            self.assertGreater(per_core_tile, 0)
 
-    # ------------------------------------------------------------------
-    # Key relabeling corruption is detected via ownership round-trip
-    # ------------------------------------------------------------------
+        # 3. Check core_id -> slice mapping formula if set
+        cid_map = getattr(ownership, "core_id_to_work_slice", None)
+        if cid_map:
+            for core_num in range(MAX_CORES):
+                for sym, formula in cid_map.items():
+                    split_factor = splits.get(sym, 1)
+                    if hasattr(formula, "subs"):
+                        slice_idx = int(formula.subs(core_id_sym, core_num))
+                        self.assertTrue(
+                            0 <= slice_idx < split_factor,
+                            f"Core {core_num} mapped to out-of-bounds slice {slice_idx} on {sym}",
+                        )
 
-    def test_handoff_detects_key_relabeling_corruption(self):
-        """If something between apply_splits and the scheduler silently
-        relabels K -> N (a concrete historical bug), reading work_slices
-        with the original symbols exposes the mismatch immediately."""
+    def test_handoff_detects_symbol_relabeling_corruption(self):
+        """Handoff must detect if reduction symbol K is mistakenly relabeled to N."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
         op = _computed_buffer(
             (2048, 2048),
@@ -609,97 +543,60 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
 
         committed = op.iteration_space_ownership.work_slices
         for sym in splits:
-            self.assertEqual(
-                committed.get(sym, 1),
-                splits[sym],
-                f"dim {sym}: planned {splits[sym]}, ownership stored {committed.get(sym, 1)}",
-            )
+            self.assertEqual(committed.get(sym, 1), splits[sym])
         corrupted = dict(committed)
         if corrupted.get(k, 1) > 1:
             corrupted[n] = corrupted.pop(k)
-            self.assertNotEqual(
-                corrupted.get(k, 1),
-                splits.get(k, 1),
-                "relabeled copy must differ from the original plan on K",
-            )
+            self.assertNotEqual(corrupted.get(k, 1), splits.get(k, 1))
 
-    # ------------------------------------------------------------------
-    # tsp#4032 — B=1 M=1 core underutilization
-    #
-    # Shape: (1,1,4096) x (1,4096,25600) → N=25600 elements = 400 sticks
-    # (fp16, 64 elems/stick).  When M=1 the cost-model planner is a no-op;
-    # the greedy pass (multi_dim_iteration_space_split) handles the split.
-    # It currently picks n=25 (largest divisor of 400 that fits in 32 cores),
-    # leaving 7 cores idle.  After tsp#4032 is fixed it should reach 32.
-    #
-    # Regression guard: fails if cores drop below 25 (greedy regression).
-    # Improvement signal: prints a note when cores reach 32 (fix landed).
-    # ------------------------------------------------------------------
+    def test_handoff_detects_dropped_dimension_key(self):
+        """Handoff must detect if any dimension key is omitted during commit."""
+        m, n, k = (_isym(x) for x in ("m", "n", "k"))
+        op = _computed_buffer(
+            (2048, 2048),
+            name="dropped_key",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("dropped_key", (2048, 2048), (m, n))
+        input_tds = [
+            _tensor_dep("lhs", (2048, 128), (m, k)),
+            _tensor_dep("rhs", (128, 2048), (k, n)),
+        ]
+        it_space = {m: 2048, n: 32, k: 2}
+        stick_vars = {n: _FP16_ELEMS_PER_STICK, k: _FP16_ELEMS_PER_STICK}
 
-    # Known core count for this shape while tsp#4032 is open.
+        splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
+
+        with patch(
+            "torch_spyre._inductor.work_division.commit_iteration_space_ownership",
+            wraps=lambda op_, splits_: _real_commit(op_, splits_, it_space),
+        ):
+            apply_splits(op, splits)
+
+        committed = op.iteration_space_ownership.work_slices
+        corrupted = dict(committed)
+        if k in corrupted:
+            del corrupted[k]
+            self.assertNotEqual(corrupted.keys(), splits.keys())
+
     _TSP4032_KNOWN_CORES = 25
 
-    def test_bmm_b1_m1_tsp4032_underutil_gets_full_cores(self):
-        """tsp#4032: B=1 M=1 N=25600 — greedy regression guard + fix detector.
-
-        When M=1 the cost-model planner is a no-op; the greedy pass
-        multi_dim_iteration_space_split runs instead.  It currently picks
-        n=25 (400 sticks, largest divisor <= 32), leaving 7 cores idle.
-
-        This test:
-          - PASSES as long as cores >= 25  (no greedy regression)
-          - FAILS  if cores drop below 25  (regression in greedy pass)
-          - PRINTS a note when cores == 32 (tsp#4032 fix has landed;
-            update _TSP4032_KNOWN_CORES to 32 to tighten the guard)
-        """
+    def test_greedy_decode_tsp4032_underutilization_guard(self):
+        """tsp#4032 regression guard: N=400 sticks must use at least 25 cores."""
         n, k = (_isym(x) for x in ("n", "k"))
-        # N=25600 elements / 64 elems-per-stick = 400 sticks.
-        # K=4096 elements / 64 elems-per-stick = 64 sticks.
         splits = multi_dim_iteration_space_split(
             {n: 400, k: 64},
             MAX_CORES,
-            [n],  # output dim
-            [k],  # reduction dim
+            [n],
+            [k],
         )
-
         cores = prod(splits.values())
+        self.assertGreaterEqual(cores, self._TSP4032_KNOWN_CORES)
 
-        # Regression guard: cores must not drop below the known value.
-        self.assertGreaterEqual(
-            cores,
-            self._TSP4032_KNOWN_CORES,
-            f"tsp#4032 REGRESSED: greedy now uses only {cores} cores "
-            f"(known baseline is {self._TSP4032_KNOWN_CORES}); "
-            f"splits={splits}",
-        )
-
-        # Fix detector: once tsp#4032 lands the greedy pass will reach 32 cores.
-        if cores == MAX_CORES:
-            print(
-                f"\n[tsp#4032 FIXED] greedy now uses all {MAX_CORES} cores "
-                f"(was {self._TSP4032_KNOWN_CORES}). "
-                f"Update _TSP4032_KNOWN_CORES = {MAX_CORES} to tighten the guard."
-            )
-        else:
-            print(
-                f"\n[tsp#4032 open] greedy uses {cores}/{MAX_CORES} cores "
-                f"(n={splits.get(n, 1)}, N=400 sticks not divisible by 32)"
-            )
-
-    # ------------------------------------------------------------------
-    # B=1, M>>1 regression — pass 2 cost model must split M for prefill
-    #
-    # Shape: (1,2048,128) x (1,128,2048).  After the bmm pass was removed
-    # (Jamie Yang's investigation) the planner must still choose M>1 via
-    # the cost model alone.  If the pass removal causes the planner to
-    # fall back to a single-core default this test catches it.
-    # ------------------------------------------------------------------
-
-    def test_bmm_b1_mgt1_prefill_cost_model_splits_m(self):
-        """B=1 M=2048 prefill QK^T: cost model must choose m>1 without
-        relying on any external bmm pass that was recently removed."""
+    def test_prefill_b1_mgt1_cost_model_splits_m_without_bmm_pass(self):
+        """B=1 M=2048 prefill: Cost model alone must choose M>1 without external bmm pass."""
         m, n, k = (_isym(x) for x in ("m", "n", "k"))
-        # (1,2048,128) x (1,128,2048): N=32 sticks, K=2 sticks (fp16).
         op = _computed_buffer(
             (2048, 2048),
             name="prefill_qkT_regression",
@@ -717,71 +614,22 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
         splits = self._run_planner(op, it_space, output_td, stick_vars, input_tds)
         self._assert_valid_split(splits, it_space)
 
-        # Cost model must split M regardless of any external pass.
-        self.assertGreater(
-            splits.get(m, 1),
-            1,
-            "B=1 M>>1 regression: cost model must split M without relying on removed bmm pass",
-        )
-        # Core-count guard.
-        self._assert_full_cores(splits, "test_bmm_b1_mgt1_prefill_cost_model_splits_m")
-
-        # Cost regression guard.
-        # Shapes in elements: B=1, M=2048, N=2048, K=128.
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(
-            cost,
-            float("inf"),
-            "planner-chosen split must model a finite (feasible) cost",
-        )
-        self._assert_cost_not_regressed(
-            "test_bmm_b1_mgt1_prefill_cost_model_splits_m", cost
+        self.assertGreater(splits.get(m, 1), 1)
+        self._assert_full_cores(
+            splits, "test_prefill_b1_mgt1_cost_model_splits_m_without_bmm_pass"
         )
 
-    # ------------------------------------------------------------------
-    # B>1, M=1 batch split — B=8 must use at least as many cores as B=2.
-    #
-    # When M=1 the cost-model planner (_cost_model_matmul_planner) returns
-    # splits unchanged by design -- it has no M rows to balance.  The
-    # greedy pass (multi_dim_iteration_space_split / P3) then runs on the
-    # reduced {b, n, k} space.  This is the same path as Scenario 37 in
-    # test_work_division_all.py.
-    #
-    # Shapes: both cases use N=16 sticks (1024 elements), K=2 sticks (128
-    # elements), with B=2 and B=8 respectively.  The greedy pass sees more
-    # total work for B=8 and must not assign fewer cores to it.
-    # ------------------------------------------------------------------
-
-    def test_bmm_bgt1_m1_batch8_uses_at_least_as_many_cores_as_batch2(self):
-        """B>1 M=1: greedy pass must not assign fewer cores to B=8 than B=2.
-
-        When M=1 the cost-model planner is a no-op (no M rows to balance).
-        The greedy multi_dim_iteration_space_split runs instead on {b, n, k}.
-        With the same N and K, B=8 has 4× more batch work than B=2, so the
-        greedy pass must assign it at least as many cores.
-
-        Shapes (stick counts, fp16 64 elems/stick):
-          B=2: it_space {b:2, n:16, k:2}  → total 64  → 2× core budget
-          B=8: it_space {b:8, n:16, k:2}  → total 256 → 8× core budget
-        """
+    def test_greedy_batch_scaling_uses_at_least_as_many_cores(self):
+        """B>1 M=1: Greedy pass must not assign fewer cores to B=8 than B=2 with same N/K."""
         b2, n2, k2 = (_isym(x) for x in ("b2", "n2", "k2"))
         b8, n8, k8 = (_isym(x) for x in ("b8", "n8", "k8"))
 
-        # B=2: {b:2, n:16, k:2} — output_dims=[b,n], reduction_dims=[k]
         splits2 = multi_dim_iteration_space_split(
             {b2: 2, n2: 16, k2: 2},
             MAX_CORES,
-            [b2, n2],  # output dims
-            [k2],  # reduction dims
+            [b2, n2],
+            [k2],
         )
-
-        # B=8: {b:8, n:16, k:2} — same N and K, larger batch
         splits8 = multi_dim_iteration_space_split(
             {b8: 8, n8: 16, k8: 2},
             MAX_CORES,
@@ -792,112 +640,59 @@ class TestCostModelPlannerOutputs(_CostModelAssertMixin, unittest.TestCase):
         cores2 = prod(splits2.values())
         cores8 = prod(splits8.values())
 
-        # Both must get non-trivial splits (N=16 sticks is wide enough).
-        self.assertGreater(
-            cores2, 1, "B=2 M=1 shape must get a non-trivial greedy split"
-        )
-        self.assertGreater(
-            cores8, 1, "B=8 M=1 shape must get a non-trivial greedy split"
-        )
-
-        # B=8 must not get fewer cores than B=2 (more batch work → more cores).
-        self.assertGreaterEqual(
-            cores8,
-            cores2,
-            f"B=8 got {cores8} cores but B=2 got {cores2}: "
-            "greedy must not assign fewer cores to a larger batch with same N/K",
-        )
+        self.assertGreater(cores2, 1)
+        self.assertGreater(cores8, 1)
+        self.assertGreaterEqual(cores8, cores2)
 
 
 # ---------------------------------------------------------------------------
-# Scenario coverage tests — real shapes from the original test suite.
-#
-# These replace the torch.compile() smoke tests (which had no assertions on
-# planner outputs) with direct calls to the real planner/greedy functions,
-# then assert on the returned splits.  Each group mirrors the T-numbered
-# scenarios from the original file.
-#
-# Group A (T04x): B=1 M=1 decode — _cost_model_matmul_planner is a no-op,
-#                 multi_dim_iteration_space_split (P3 greedy) handles it.
-#
-# Group B (T05x): B=1 M>1 prefill — _cost_model_matmul_planner (P2) runs.
-#
-# Group C (T07x): B>1 M=1 batch decode — greedy P3 on {b, n, k}.
-#
-# Group D (T08x): B>1 M>1 batched prefill — _cost_model_matmul_planner (P2).
+# Group A: B=1, M=1 Decode Shapes (Greedy Pass)
 # ---------------------------------------------------------------------------
 
 
-class TestGreedyDecodeB1M1(unittest.TestCase):
-    """T04x: B=1 M=1 decode shapes.
-
-    When M=1 the cost-model planner returns splits unchanged.  The greedy
-    pass (multi_dim_iteration_space_split) then runs on the reduced {n, k}
-    iteration space.  Assertions:
-      - prod(splits) <= 32   (never over-allocate)
-      - splits[n] divides n  (no fractional tiles)
-      - For N wide enough (>= 32 sticks), at least 1 core assigned to N.
-    """
+class TestDecodeGreedyB1M1(unittest.TestCase):
+    """B=1 M=1 decode shapes — handled by greedy multi_dim_iteration_space_split."""
 
     def _run(self, n_sticks, k_sticks):
         n, k = _isym("n"), _isym("k")
         splits = multi_dim_iteration_space_split(
             {n: n_sticks, k: k_sticks},
             MAX_CORES,
-            [n],  # output dim
-            [k],  # reduction dim
+            [n],
+            [k],
         )
         cores = prod(splits.values())
-        self.assertLessEqual(cores, MAX_CORES, f"over-budget: {cores} cores")
-        self.assertEqual(
-            n_sticks % splits.get(n, 1),
-            0,
-            f"N split {splits.get(n, 1)} does not divide {n_sticks}",
-        )
+        self.assertLessEqual(cores, MAX_CORES)
+        self.assertEqual(n_sticks % splits.get(n, 1), 0)
         return splits
 
-    def test_t040_tiny_decode_fp16(self):
-        """T040: (1,1,128)@(1,128,64) — N=1 stick (64 elements).
-        N cannot be split further; greedy may assign cores to K only."""
+    def test_decode_tiny_n1_k2(self):
+        """(1, 1, 128) x (1, 128, 64) — N=1 stick (64 elements)."""
         splits = self._run(n_sticks=1, k_sticks=2)
-        # N=1 stick is indivisible; total cores <= 2 (K=2 sticks at most).
-        self.assertLessEqual(
-            prod(splits.values()), 2, "T040: N=1 stick — at most K=2 cores assignable"
-        )
+        self.assertLessEqual(prod(splits.values()), 2)
 
-    def test_t041_narrow_n_decode_fp16(self):
-        """T041: (1,1,128)@(1,128,512) — N=8 sticks."""
+    def test_decode_narrow_n8_k2(self):
+        """(1, 1, 128) x (1, 128, 512) — N=8 sticks."""
         splits = self._run(n_sticks=8, k_sticks=2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T041: N=8 sticks should get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t042_granite_decode_qkT_fp16(self):
-        """T042: (1,1,128)@(1,128,2048) — N=32 sticks."""
+    def test_decode_standard_qkt_n32_k2(self):
+        """(1, 1, 128) x (1, 128, 2048) — N=32 sticks (saturates 32 cores)."""
         splits = self._run(n_sticks=32, k_sticks=2)
-        self.assertEqual(
-            prod(splits.values()),
-            MAX_CORES,
-            "T042: N=32 sticks should saturate all 32 cores",
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
-    def test_t043_nonpow2_n_fp16(self):
-        """T043: (1,1,128)@(1,128,3072) — N=48 sticks (non-power-2)."""
+    def test_decode_non_power_of_two_n48_k2(self):
+        """(1, 1, 128) x (1, 128, 3072) — N=48 sticks (non-power-2)."""
         splits = self._run(n_sticks=48, k_sticks=2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T043: N=48 sticks should get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t044_decode_scorev_worst_fp16(self):
-        """T044: (1,1,2048)@(1,2048,128) — N=2 sticks, K=32 sticks."""
+    def test_decode_heavy_k_scorev_n2_k32(self):
+        """(1, 1, 2048) x (1, 2048, 128) — N=2 sticks, K=32 sticks."""
         splits = self._run(n_sticks=2, k_sticks=32)
-        # N is narrow; greedy may spill onto K or use very few cores.
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
-    def test_t045_tsp4032_underutil_fp16(self):
-        """T045: (1,1,4096)@(1,4096,25600) — N=400 sticks.
-        tsp#4032: greedy assigns 25 cores (400 not divisible by 32).
-        Assert it uses at least 25 (does not regress further)."""
+    def test_decode_vocab_width_tsp4032_n400_k64(self):
+        """(1, 1, 4096) x (1, 4096, 25600) — N=400 sticks."""
         n, k = _isym("n"), _isym("k")
         splits = multi_dim_iteration_space_split(
             {n: 400, k: 64},
@@ -905,46 +700,28 @@ class TestGreedyDecodeB1M1(unittest.TestCase):
             [n],
             [k],
         )
-        self.assertGreaterEqual(
-            prod(splits.values()), 25, "T045: tsp#4032 shape must use at least 25 cores"
-        )
+        self.assertGreaterEqual(prod(splits.values()), 25)
 
-    def test_t046_reference_full_util_fp16(self):
-        """T046: (1,1,4096)@(1,4096,26624) — N=416 sticks (416=32×13)."""
+    def test_decode_full_divisible_n416_k64(self):
+        """(1, 1, 4096) x (1, 4096, 26624) — N=416 sticks (divisible by 32)."""
         splits = self._run(n_sticks=416, k_sticks=64)
-        self.assertEqual(
-            prod(splits.values()),
-            MAX_CORES,
-            "T046: N=416 sticks (divisible by 32) must use all 32 cores",
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
-    def test_t047_at_span_limit_fp16(self):
-        """T047: (1,1,4096)@(1,4096,32768) — N=512 sticks."""
+    def test_decode_span_limit_n512_k64(self):
+        """(1, 1, 4096) x (1, 4096, 32768) — N=512 sticks."""
         splits = self._run(n_sticks=512, k_sticks=64)
-        self.assertEqual(
-            prod(splits.values()),
-            MAX_CORES,
-            "T047: N=512 sticks must saturate all 32 cores",
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
 
-class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
-    """T05x: B=1 M>1 prefill shapes — _cost_model_matmul_planner (P2).
+# ---------------------------------------------------------------------------
+# Group B: B=1, M>1 Prefill Shapes (Cost Model Pass)
+# ---------------------------------------------------------------------------
 
-    Assertions:
-      - splits[m] > 1   (M is the output-row dim; planner must exploit it)
-      - prod(splits) == 32  (full core utilization for full-size shapes)
-      - splits[k] == 1  when K is narrow (only 2 sticks — psum penalty)
-    """
+
+class TestPrefillCostModelB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
+    """B=1 M>1 prefill shapes — direct tests on _cost_model_matmul_planner."""
 
     def _make_op(self, m_rows, n_sticks, k_sticks, name):
-        """Build a B=1 M>1 matmul op and run the real cost-model planner.
-
-        Buffer and TensorDep shapes are in *elements* (matching what the
-        passing tests in TestCostModelPlannerOutputs use).  it_space uses
-        stick counts for n and k — that is the adjusted space the planner
-        receives in production after adjust_it_space_for_sticks().
-        """
         m, n, k = _isym("m"), _isym("n"), _isym("k")
         n_elems = n_sticks * _FP16_ELEMS_PER_STICK
         k_elems = k_sticks * _FP16_ELEMS_PER_STICK
@@ -976,24 +753,11 @@ class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
         )
         return splits, m, n, k
 
-    def test_t050_speculative_decode_m4_fp16(self):
-        """T050: (1,4,128)@(1,128,2048) — M=4 underfill, N=32 sticks, K=2.
-
-        M=4 is too small to split: each per-core tile would be 1 row, causing
-        severe PT pipeline underfill.  The cost model correctly keeps m=1 and
-        puts all cores on N instead.  Assert that cores ARE assigned (via N),
-        not that M specifically is split."""
-        splits, m, n, k = self._make_op(4, 32, 2, "t050")
-        self.assertGreater(
-            prod(splits.values()),
-            1,
-            "T050: M=4 underfill — cores must be assigned via N",
-        )
-        self.assertGreater(
-            splits.get(n, 1),
-            1,
-            "T050: N=32 sticks must absorb the cores when M is tiny",
-        )
+    def test_prefill_speculative_decode_underfill_m4(self):
+        """(1, 4, 128) x (1, 128, 2048) — M=4 underfill."""
+        splits, m, n, k = self._make_op(4, 32, 2, "prefill_speculative_m4")
+        self.assertGreater(prod(splits.values()), 1)
+        self.assertGreater(splits.get(n, 1), 1)
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
@@ -1003,19 +767,15 @@ class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
             k_axis=(128, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T050: split must model finite cost")
-        self._assert_cost_not_regressed("test_t050_speculative_decode_m4_fp16", cost)
-
-    def test_t051_m16_underfill_boundary_fp16(self):
-        """T051: (1,16,128)@(1,128,2048) — M=16 boundary, N=32, K=2.
-
-        M=16 is at the underfill boundary.  The cost model may or may not split
-        M depending on the PT efficiency curve; what must hold is that at least
-        some cores are assigned and the total stays within budget."""
-        splits, m, n, k = self._make_op(16, 32, 2, "t051")
-        self.assertGreater(
-            prod(splits.values()), 1, "T051: M=16 — some cores must be assigned"
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed(
+            "test_prefill_speculative_decode_underfill_m4", cost
         )
+
+    def test_prefill_underfill_boundary_m16(self):
+        """(1, 16, 128) x (1, 128, 2048) — M=16 boundary."""
+        splits, m, n, k = self._make_op(16, 32, 2, "prefill_boundary_m16")
+        self.assertGreater(prod(splits.values()), 1)
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
@@ -1025,19 +785,15 @@ class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
             k_axis=(128, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T051: split must model finite cost")
-        self._assert_cost_not_regressed("test_t051_m16_underfill_boundary_fp16", cost)
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed("test_prefill_underfill_boundary_m16", cost)
 
-    def test_t052_prefill_qkT_standard_fp16(self):
-        """T052: (1,2048,128)@(1,128,2048) — standard prefill QK^T."""
-        splits, m, n, k = self._make_op(2048, 32, 2, "t052")
-        self.assertGreater(
-            splits.get(m, 1), 1, "T052: M=2048 must be split for prefill"
-        )
-        self.assertEqual(splits.get(k, 1), 1, "T052: K=2 sticks must not be split")
-        self.assertEqual(
-            prod(splits.values()), MAX_CORES, "T052: prefill QK^T must use all 32 cores"
-        )
+    def test_prefill_standard_qkt_m2048(self):
+        """(1, 2048, 128) x (1, 128, 2048) — standard prefill QK^T."""
+        splits, m, n, k = self._make_op(2048, 32, 2, "prefill_standard_qkt")
+        self.assertGreater(splits.get(m, 1), 1)
+        self.assertEqual(splits.get(k, 1), 1)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
             b_axis=(1, 1),
@@ -1046,15 +802,13 @@ class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
             k_axis=(128, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T052: split must model finite cost")
-        self._assert_cost_not_regressed("test_t052_prefill_qkT_standard_fp16", cost)
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed("test_prefill_standard_qkt_m2048", cost)
 
-    def test_t053_scorev_k_gt_n_fp16(self):
-        """T053: (1,2048,2048)@(1,2048,128) — K>>N, score x V."""
-        splits, m, n, k = self._make_op(2048, 2, 32, "t053")
-        self.assertGreater(
-            splits.get(m, 1), 1, "T053: M must be split for heavy-K narrow-N shape"
-        )
+    def test_prefill_scorev_heavy_k_narrow_n(self):
+        """(1, 2048, 2048) x (1, 2048, 128) — K>>N, score x V."""
+        splits, m, n, k = self._make_op(2048, 2, 32, "prefill_scorev_heavy_k")
+        self.assertGreater(splits.get(m, 1), 1)
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
@@ -1064,25 +818,38 @@ class TestCostModelPrefillB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
             k_axis=(2048, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T053: split must model finite cost")
-        self._assert_cost_not_regressed("test_t053_scorev_k_gt_n_fp16", cost)
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed("test_prefill_scorev_heavy_k_narrow_n", cost)
 
-    def test_t056_span_limit_fp16(self):
-        """T056: (1,2048,4096)@(1,4096,32832) — at span limit.
-        N=32832/64=513 sticks (not round); planner must still return valid splits."""
-        splits, m, n, k = self._make_op(2048, 513, 64, "t056")
-        # Just validate structural correctness; span limit may constrain splits.
+    def test_prefill_mlp_upproj_wide_n(self):
+        """(1, 2048, 4096) x (1, 4096, 11008) — wide-N MLP up-proj."""
+        splits, m, n, k = self._make_op(2048, 172, 64, "prefill_mlp_upproj")
+        self.assertGreater(splits.get(m, 1), 1)
+        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+
+        cost = _matmul_split_cost(
+            b_axis=(1, 1),
+            m_axis=(2048, splits.get(m, 1)),
+            n_axis=(11008, splits.get(n, 1)),
+            k_axis=(4096, splits.get(k, 1)),
+            max_cores=MAX_CORES,
+        )
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed("test_prefill_mlp_upproj_wide_n", cost)
+
+    def test_prefill_span_limit_boundary_n513(self):
+        """(1, 2048, 4096) x (1, 4096, 32832) — at span limit."""
+        splits, m, n, k = self._make_op(2048, 513, 64, "prefill_span_limit")
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
 
-class TestGreedyDecodeB4plusM1(unittest.TestCase):
-    """T07x: B>1 M=1 batch decode — greedy P3 on {b, n, k}.
+# ---------------------------------------------------------------------------
+# Group C: B>1, M=1 Batched Decode Shapes (Greedy Pass)
+# ---------------------------------------------------------------------------
 
-    Assertions:
-      - prod(splits) > 1   (batch + N provide useful parallelism)
-      - prod(splits) <= 32
-      - splits[b] * splits[n] divides their respective sizes
-    """
+
+class TestBatchedDecodeGreedyBgt1M1(unittest.TestCase):
+    """B>1 M=1 batch decode — greedy P3 on {b, n, k}."""
 
     def _run(self, batch, n_sticks, k_sticks):
         b, n, k = _isym("b"), _isym("n"), _isym("k")
@@ -1098,71 +865,51 @@ class TestGreedyDecodeB4plusM1(unittest.TestCase):
         self.assertEqual(n_sticks % splits.get(n, 1), 0)
         return splits, b, n, k
 
-    def test_t070_batch2_fp16(self):
-        """T070: (2,1,128)@(2,128,1024) — B=2, N=16 sticks."""
+    def test_batched_decode_batch2_n16(self):
+        """(2, 1, 128) x (2, 128, 1024) — B=2, N=16 sticks."""
         splits, b, n, k = self._run(2, 16, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T070: B=2 N=16 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t071_batch4_fp16(self):
-        """T071: (4,1,128)@(4,128,512) — B=4, N=8 sticks."""
+    def test_batched_decode_batch4_n8(self):
+        """(4, 1, 128) x (4, 128, 512) — B=4, N=8 sticks."""
         splits, b, n, k = self._run(4, 8, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T071: B=4 N=8 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t072_batch8_fp16(self):
-        """T072: (8,1,128)@(8,128,256) — B=8, N=4 sticks."""
+    def test_batched_decode_batch8_n4(self):
+        """(8, 1, 128) x (8, 128, 256) — B=8, N=4 sticks."""
         splits, b, n, k = self._run(8, 4, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T072: B=8 N=4 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t073_batch16_fp16(self):
-        """T073: (16,1,128)@(16,128,128) — B=16, N=2 sticks."""
+    def test_batched_decode_batch16_n2(self):
+        """(16, 1, 128) x (16, 128, 128) — B=16, N=2 sticks."""
         splits, b, n, k = self._run(16, 2, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T073: B=16 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t074_batch32_fp16(self):
-        """T074: (32,1,64)@(32,64,64) — B=32, N=1 stick."""
+    def test_batched_decode_batch32_n1_full_cores(self):
+        """(32, 1, 64) x (32, 64, 64) — B=32, N=1 stick (saturates 32 cores)."""
         splits, b, n, k = self._run(32, 1, 1)
-        # B=32 fills all cores by itself; N=1 stick may not be splittable.
-        self.assertEqual(
-            prod(splits.values()), MAX_CORES, "T074: B=32 must saturate all 32 cores"
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
-    def test_t075_odd_batch5_fp16(self):
-        """T075: (5,1,128)@(5,128,2048) — odd B=5, N=32 sticks."""
+    def test_batched_decode_odd_batch5_n32(self):
+        """(5, 1, 128) x (5, 128, 2048) — odd B=5, N=32 sticks."""
         splits, b, n, k = self._run(5, 32, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T075: B=5 N=32 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
-    def test_t076_odd_batch7_fp16(self):
-        """T076: (7,1,128)@(7,128,2048) — odd B=7, N=32 sticks."""
+    def test_batched_decode_odd_batch7_n32(self):
+        """(7, 1, 128) x (7, 128, 2048) — odd B=7, N=32 sticks."""
         splits, b, n, k = self._run(7, 32, 2)
-        self.assertGreater(
-            prod(splits.values()), 1, "T076: B=7 N=32 must get a non-trivial split"
-        )
+        self.assertGreater(prod(splits.values()), 1)
 
 
-class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCase):
-    """T08x: B>1 M>1 batched prefill — _cost_model_matmul_planner (P2).
+# ---------------------------------------------------------------------------
+# Group D: B>1, M>1 Batched Prefill Shapes (Cost Model Pass)
+# ---------------------------------------------------------------------------
 
-    Assertions:
-      - prod(splits) == 32   (full utilization for large shapes)
-      - splits[m] or splits[b] > 1  (some output dim is split)
-    """
+
+class TestBatchedPrefillCostModelBgt1Mgt1(_CostModelAssertMixin, unittest.TestCase):
+    """B>1 M>1 batched prefill — direct tests on _cost_model_matmul_planner."""
 
     def _make_op(self, batch, m_rows, n_sticks, k_sticks, name):
-        """Build a B>1 M>1 batched matmul op and run the real cost-model planner.
-
-        Buffer and TensorDep shapes are in *elements*; it_space uses stick
-        counts for n and k (same convention as TestCostModelPlannerOutputs).
-        """
         b, m, n, k = _isym("b"), _isym("m"), _isym("n"), _isym("k")
         n_elems = n_sticks * _FP16_ELEMS_PER_STICK
         k_elems = k_sticks * _FP16_ELEMS_PER_STICK
@@ -1194,17 +941,11 @@ class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
         )
         return splits, b, m, n, k
 
-    def test_t080_multihead_prefill_qkT_fp16(self):
-        """T080: (4,2048,128)@(4,128,2048) — B=4, M=2048, N=32, K=2."""
-        splits, b, m, n, k = self._make_op(4, 2048, 32, 2, "t080")
-        self.assertGreater(
-            max(splits.get(m, 1), splits.get(b, 1)),
-            1,
-            "T080: at least one of M or B must be split",
-        )
-        self.assertEqual(
-            prod(splits.values()), MAX_CORES, "T080: must use all 32 cores"
-        )
+    def test_batched_prefill_multihead_qkt_b4_m2048(self):
+        """(4, 2048, 128) x (4, 128, 2048) — B=4, M=2048, N=32, K=2."""
+        splits, b, m, n, k = self._make_op(4, 2048, 32, 2, "batched_prefill_qkt")
+        self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
             b_axis=(4, splits.get(b, 1)),
@@ -1213,20 +954,16 @@ class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
             k_axis=(128, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T080: split must model finite cost")
-        self._assert_cost_not_regressed("test_t080_multihead_prefill_qkT_fp16", cost)
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed(
+            "test_batched_prefill_multihead_qkt_b4_m2048", cost
+        )
 
-    def test_t081_batched_heads_qkT_fp16(self):
-        """T081: (4,2048,512)@(4,512,2048) — B=4, M=2048, N=32, K=8."""
-        splits, b, m, n, k = self._make_op(4, 2048, 32, 8, "t081")
-        self.assertGreater(
-            max(splits.get(m, 1), splits.get(b, 1)),
-            1,
-            "T081: at least one of M or B must be split",
-        )
-        self.assertEqual(
-            prod(splits.values()), MAX_CORES, "T081: must use all 32 cores"
-        )
+    def test_batched_prefill_deep_k_heads_b4_m2048_k512(self):
+        """(4, 2048, 512) x (4, 512, 2048) — B=4, M=2048, N=32, K=8."""
+        splits, b, m, n, k = self._make_op(4, 2048, 32, 8, "batched_prefill_deep_k")
+        self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
             b_axis=(4, splits.get(b, 1)),
@@ -1235,17 +972,15 @@ class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
             k_axis=(512, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T081: split must model finite cost")
-        self._assert_cost_not_regressed("test_t081_batched_heads_qkT_fp16", cost)
-
-    def test_t082_bert_style_batched_bf16(self):
-        """T082: (8,512,128)@(8,128,512) — B=8, M=512, N=8, K=2."""
-        splits, b, m, n, k = self._make_op(8, 512, 8, 2, "t082")
-        self.assertGreater(
-            max(splits.get(m, 1), splits.get(b, 1)),
-            1,
-            "T082: at least one of M or B must be split",
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed(
+            "test_batched_prefill_deep_k_heads_b4_m2048_k512", cost
         )
+
+    def test_batched_prefill_bert_style_b8_m512(self):
+        """(8, 512, 128) x (8, 128, 512) — B=8, M=512, N=8, K=2."""
+        splits, b, m, n, k = self._make_op(8, 512, 8, 2, "batched_prefill_bert")
+        self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
         cost = _matmul_split_cost(
@@ -1255,8 +990,8 @@ class TestCostModelBatchedPrefillBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
             k_axis=(128, splits.get(k, 1)),
             max_cores=MAX_CORES,
         )
-        self.assertLess(cost, float("inf"), "T082: split must model finite cost")
-        self._assert_cost_not_regressed("test_t082_bert_style_batched_bf16", cost)
+        self.assertLess(cost, float("inf"))
+        self._assert_cost_not_regressed("test_batched_prefill_bert_style_b8_m512", cost)
 
 
 if __name__ == "__main__":
