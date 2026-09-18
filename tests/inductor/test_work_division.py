@@ -1852,6 +1852,67 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
 
 
+class TestCloneDivisionMatching(unittest.TestCase):
+    """The clone-in seam: the pairs a graph input's synthesized menu admits.
+
+    The sibling of :class:`TestResidencyEdgeMatching` for the one edge with no
+    producer: a clone's view *is* its consumer's, so nothing compares two views
+    here and the broadcast check in ``_clone_divisions_and_matches`` is the
+    only thing standing between a broadcast read and a plan ``_post_solve`` can
+    only reject.
+    """
+
+    def setUp(self):
+        x, y = _isym("x"), _isym("y")
+        # One consumer, three candidates. The middle one splits ``y``, an axis
+        # the input does not carry, so the split contracts out of the view and
+        # all four cores read the whole buffer.
+        self.consumer_divs = [
+            CoreDivision(splits={x: 4}),
+            CoreDivision(splits={y: 4}),
+            CoreDivision(splits={x: 2}),
+        ]
+        self.views = [
+            _physical_view((0, 4)),
+            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=4),
+            _physical_view((0, 2)),
+        ]
+        self.consumer = MagicMock(spec=ComputedBuffer)
+        self.consumer.get_name.return_value = "consumer"
+        self.rw = MagicMock(
+            reads=[MemoryDep("inp", x, (x,), (8,))],
+            writes=[MemoryDep("consumer", x, (x,), (8,))],
+        )
+
+    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
+        index = [cd.splits for cd in self.consumer_divs].index(splits)
+        return (self.views[index], False, True)
+
+    def _menu(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with ExitStack() as stack:
+            for target, kwargs in [
+                ("_view_for_div", {"side_effect": self._view_for_div}),
+                ("op_read_writes", {"return_value": self.rw}),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.scratchpad.allocator.{target}",
+                        **kwargs,
+                    )
+                )
+            return allocator._clone_divisions_and_matches(
+                "inp", [self.consumer], {"consumer": self.consumer_divs}, {}
+            )
+
+    def test_broadcast_read_reaches_neither_the_menu_nor_the_table(self):
+        divs, matches = self._menu()
+        self.assertEqual(
+            [cd.splits for cd in divs], [{_isym("x"): split} for split in (4, 2)]
+        )
+        self.assertEqual(matches, {"consumer": [(0, 0), (1, 2)]})
+
+
 class TestCoOptimizingAllocator(unittest.TestCase):
     def test_fixed_illegal_split_raises_unsupported(self):
         op = MagicMock(spec=ComputedBuffer, name="fixed_op")
