@@ -71,6 +71,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     relayout_copy_name,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.double_buf_tile_allocator import DoubleBufTileAllocator
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
@@ -3259,6 +3260,7 @@ _PLACEMENT_SOLVERS: dict[str, LayoutSolverFactory] = {
     "firstfit": FirstFitLayoutSolver,
     "simulated_annealing": SimulatedAnnealingLayoutSolver,
     "cpsat": _make_cpsat_solver,
+    "double_buf_tile": DoubleBufTileAllocator,
 }
 
 

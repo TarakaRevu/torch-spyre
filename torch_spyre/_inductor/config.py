@@ -239,7 +239,7 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 # solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
 layout_solver: Literal[
-    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
+    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing", "double_buf_tile"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
