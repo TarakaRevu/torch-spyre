@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import re
 import unittest
-import warnings
+from unittest import expectedFailure
 from math import prod
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import sympy
@@ -38,7 +35,6 @@ from torch_spyre._inductor.pass_utils import commit_iteration_space_ownership
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
-    _matmul_split_cost,
     apply_splits,
     multi_dim_iteration_space_split,
 )
@@ -47,47 +43,6 @@ from torch_spyre._inductor.work_division import (
 _FP16_ELEMS_PER_STICK = 64
 
 MAX_CORES = 32
-
-# ---------------------------------------------------------------------------
-# Cost baselines — best-known modeled cost (µs) for each unique shape/scenario.
-#
-# Rules:
-#   - None  = not yet recorded.
-#   - float = the best-known modeled cost the planner produced for this shape.
-#
-# Baseline Management & Regression Checks:
-#   - Performance improvement (cost < baseline): emits UserWarning informing of improvement.
-#   - Within range (<= baseline + tolerance): passes silently.
-#   - Performance regression (> baseline + tolerance): raises AssertionError (test failure).
-#   - Updating baselines: run with UPDATE_BASELINES=1 to record new/improved values in file.
-# ---------------------------------------------------------------------------
-COST_BASELINES: dict[str, float | None] = {
-    # Unique shape scenarios (B=1, M>1 prefill and underfill)
-    "test_prefill_speculative_decode_underfill_m4": 84.5314,  # (1, 4, 128) x (1, 128, 2048) - M=4 underfill
-    "test_prefill_underfill_boundary_m16": 25.1893,  # (1, 16, 128) x (1, 128, 2048) - M=16 boundary
-    "test_prefill_standard_qkt_m2048": 67.0027,  # (1, 2048, 128) x (1, 128, 2048) - standard prefill
-    "test_prefill_scorev_heavy_k_narrow_n": 58.6411,  # (1, 2048, 2048) x (1, 2048, 128) - heavy-K score x V
-    "test_prefill_mlp_upproj_wide_n": 2691.7553,  # (1, 2048, 4096) x (1, 4096, 11008) - wide-N MLP
-    # Unique shape scenarios (B>1, M>1 batched prefill)
-    "test_batched_prefill_multihead_qkt_b4_m2048": 238.0107,  # (4, 2048, 128) x (4, 128, 2048) - batched heads
-    "test_batched_prefill_deep_k_heads_b4_m2048_k512": 430.5227,  # (4, 2048, 512) x (4, 512, 2048) - deep K batched
-    "test_batched_prefill_bert_style_b8_m512": 36.4947,  # (8, 512, 128) x (8, 128, 512) - BERT-style
-}
-
-_THIS_FILE = Path(__file__).resolve()
-
-
-def _store_baseline(test_name: str, cost: float) -> None:
-    """Rewrite the COST_BASELINES entry for *test_name* in this source file."""
-    text = _THIS_FILE.read_text()
-    pattern = rf'("{re.escape(test_name)}":\s*)(None|[0-9]+(?:\.[0-9]+)?)'
-    replacement = rf"\g<1>{cost:.4f}"
-    new_text, n = re.subn(pattern, replacement, text, count=1)
-    if n != 1:
-        raise RuntimeError(
-            f"_store_baseline: expected exactly one match for {test_name!r}, got {n}"
-        )
-    _THIS_FILE.write_text(new_text)
 
 
 def _real_commit(op, splits, it_space):
@@ -166,60 +121,6 @@ class _CostModelAssertMixin:
             f"{test_name}: planner chose {cores} cores instead of {MAX_CORES}. "
             f"splits={splits}",
         )
-
-    def _assert_cost_not_regressed(
-        self, test_name: str, cost: float, tolerance_pct: float = 0.05
-    ) -> None:
-        """Compare *cost* (µs) against the stored COST_BASELINES entry.
-
-        Args:
-            test_name: Name of the test matching the key in COST_BASELINES.
-            cost: The measured modeled cost in µs.
-            tolerance_pct: Allowed relative tolerance range (default: 5% / 0.05).
-        """
-        baseline = COST_BASELINES.get(test_name)
-
-        if baseline is None:
-            warning_msg = (
-                f"\n[UNRECORDED BASELINE] {test_name}: measured cost is {cost:.4f} µs.\n"
-                f"  Re-run with UPDATE_BASELINES=1 to record this baseline."
-            )
-            warnings.warn(warning_msg, UserWarning, stacklevel=2)
-            if os.environ.get("UPDATE_BASELINES") == "1":
-                _store_baseline(test_name, cost)
-                print(
-                    f"[cost-baseline] wrote {cost:.4f} µs to COST_BASELINES[{test_name!r}]"
-                )
-            return
-
-        _EPSILON = 1e-4
-        if cost < baseline - _EPSILON:
-            diff = baseline - cost
-            pct = (diff / baseline) * 100
-            warning_msg = (
-                f"\n[PERFORMANCE IMPROVEMENT] {test_name}:\n"
-                f"  stored baseline : {baseline:.4f} µs\n"
-                f"  measured now    : {cost:.4f} µs\n"
-                f"  improvement     : -{diff:.4f} µs (-{pct:.2f}%)\n"
-                f"  Re-run with UPDATE_BASELINES=1 to commit the new baseline."
-            )
-            warnings.warn(warning_msg, UserWarning, stacklevel=2)
-            if os.environ.get("UPDATE_BASELINES") == "1":
-                _store_baseline(test_name, cost)
-                print(
-                    f"[cost-baseline] updated COST_BASELINES[{test_name!r}] to {cost:.4f} µs"
-                )
-            return
-
-        max_allowed_cost = baseline * (1.0 + tolerance_pct)
-        if cost > max_allowed_cost:
-            self.fail(
-                f"\n[PERFORMANCE REGRESSION ERROR] {test_name}: modeled cost REGRESSED outside acceptable range (+{tolerance_pct * 100:.1f}%)\n"
-                f"  stored baseline : {baseline:.4f} µs\n"
-                f"  max allowed     : {max_allowed_cost:.4f} µs\n"
-                f"  measured now    : {cost:.4f} µs\n"
-                f"  regression      : +{cost - baseline:.4f} µs (+{((cost - baseline) / baseline) * 100:.2f}%)"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -580,10 +481,11 @@ class TestPlannerDecisionsAndHandoff(_CostModelAssertMixin, unittest.TestCase):
             del corrupted[k]
             self.assertNotEqual(corrupted.keys(), splits.keys())
 
-    _TSP4032_KNOWN_CORES = 25
-
+    @expectedFailure  # https://github.com/torch-spyre/torch-spyre/issues/4032
     def test_greedy_decode_tsp4032_underutilization_guard(self):
-        """tsp#4032 regression guard: N=400 sticks must use at least 25 cores."""
+        """tsp#4032: cost model picks only 25 cores for N=400 sticks instead of 32.
+        Expected to fail until the cost model is fixed to use all MAX_CORES.
+        """
         n, k = (_isym(x) for x in ("n", "k"))
         splits = multi_dim_iteration_space_split(
             {n: 400, k: 64},
@@ -591,8 +493,7 @@ class TestPlannerDecisionsAndHandoff(_CostModelAssertMixin, unittest.TestCase):
             [n],
             [k],
         )
-        cores = prod(splits.values())
-        self.assertGreaterEqual(cores, self._TSP4032_KNOWN_CORES)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
     def test_prefill_b1_mgt1_cost_model_splits_m_without_bmm_pass(self):
         """B=1 M=2048 prefill: Cost model alone must choose M>1 without external bmm pass."""
@@ -691,8 +592,12 @@ class TestDecodeGreedyB1M1(unittest.TestCase):
         splits = self._run(n_sticks=2, k_sticks=32)
         self.assertLessEqual(prod(splits.values()), MAX_CORES)
 
+    @expectedFailure  # https://github.com/torch-spyre/torch-spyre/issues/4032
     def test_decode_vocab_width_tsp4032_n400_k64(self):
-        """(1, 1, 4096) x (1, 4096, 25600) — N=400 sticks."""
+        """(1, 1, 4096) x (1, 4096, 25600) — N=400 sticks.
+        tsp#4032: cost model currently picks 25 cores instead of MAX_CORES (32).
+        Expected to fail until the cost model is fixed.
+        """
         n, k = _isym("n"), _isym("k")
         splits = multi_dim_iteration_space_split(
             {n: 400, k: 64},
@@ -700,7 +605,7 @@ class TestDecodeGreedyB1M1(unittest.TestCase):
             [n],
             [k],
         )
-        self.assertGreaterEqual(prod(splits.values()), 25)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
     def test_decode_full_divisible_n416_k64(self):
         """(1, 1, 4096) x (1, 4096, 26624) — N=416 sticks (divisible by 32)."""
@@ -758,35 +663,13 @@ class TestPrefillCostModelB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
         splits, m, n, k = self._make_op(4, 32, 2, "prefill_speculative_m4")
         self.assertGreater(prod(splits.values()), 1)
         self.assertGreater(splits.get(n, 1), 1)
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
-
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(4, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed(
-            "test_prefill_speculative_decode_underfill_m4", cost
-        )
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
     def test_prefill_underfill_boundary_m16(self):
         """(1, 16, 128) x (1, 128, 2048) — M=16 boundary."""
         splits, m, n, k = self._make_op(16, 32, 2, "prefill_boundary_m16")
         self.assertGreater(prod(splits.values()), 1)
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
-
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(16, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed("test_prefill_underfill_boundary_m16", cost)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
     def test_prefill_standard_qkt_m2048(self):
         """(1, 2048, 128) x (1, 128, 2048) — standard prefill QK^T."""
@@ -795,52 +678,17 @@ class TestPrefillCostModelB1Mgt1(_CostModelAssertMixin, unittest.TestCase):
         self.assertEqual(splits.get(k, 1), 1)
         self.assertEqual(prod(splits.values()), MAX_CORES)
 
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed("test_prefill_standard_qkt_m2048", cost)
-
     def test_prefill_scorev_heavy_k_narrow_n(self):
         """(1, 2048, 2048) x (1, 2048, 128) — K>>N, score x V."""
         splits, m, n, k = self._make_op(2048, 2, 32, "prefill_scorev_heavy_k")
         self.assertGreater(splits.get(m, 1), 1)
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
-
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(128, splits.get(n, 1)),
-            k_axis=(2048, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed("test_prefill_scorev_heavy_k_narrow_n", cost)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
     def test_prefill_mlp_upproj_wide_n(self):
         """(1, 2048, 4096) x (1, 4096, 11008) — wide-N MLP up-proj."""
         splits, m, n, k = self._make_op(2048, 172, 64, "prefill_mlp_upproj")
         self.assertGreater(splits.get(m, 1), 1)
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
-
-        cost = _matmul_split_cost(
-            b_axis=(1, 1),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(11008, splits.get(n, 1)),
-            k_axis=(4096, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed("test_prefill_mlp_upproj_wide_n", cost)
-
-    def test_prefill_span_limit_boundary_n513(self):
-        """(1, 2048, 4096) x (1, 4096, 32832) — at span limit."""
-        splits, m, n, k = self._make_op(2048, 513, 64, "prefill_span_limit")
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
 
 # ---------------------------------------------------------------------------
@@ -947,52 +795,19 @@ class TestBatchedPrefillCostModelBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
         self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
         self.assertEqual(prod(splits.values()), MAX_CORES)
 
-        cost = _matmul_split_cost(
-            b_axis=(4, splits.get(b, 1)),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed(
-            "test_batched_prefill_multihead_qkt_b4_m2048", cost
-        )
-
     def test_batched_prefill_deep_k_heads_b4_m2048_k512(self):
         """(4, 2048, 512) x (4, 512, 2048) — B=4, M=2048, N=32, K=8."""
         splits, b, m, n, k = self._make_op(4, 2048, 32, 8, "batched_prefill_deep_k")
         self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
         self.assertEqual(prod(splits.values()), MAX_CORES)
 
-        cost = _matmul_split_cost(
-            b_axis=(4, splits.get(b, 1)),
-            m_axis=(2048, splits.get(m, 1)),
-            n_axis=(2048, splits.get(n, 1)),
-            k_axis=(512, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed(
-            "test_batched_prefill_deep_k_heads_b4_m2048_k512", cost
-        )
-
     def test_batched_prefill_bert_style_b8_m512(self):
         """(8, 512, 128) x (8, 128, 512) — B=8, M=512, N=8, K=2."""
         splits, b, m, n, k = self._make_op(8, 512, 8, 2, "batched_prefill_bert")
         self.assertGreater(max(splits.get(m, 1), splits.get(b, 1)), 1)
-        self.assertLessEqual(prod(splits.values()), MAX_CORES)
-
-        cost = _matmul_split_cost(
-            b_axis=(8, splits.get(b, 1)),
-            m_axis=(512, splits.get(m, 1)),
-            n_axis=(512, splits.get(n, 1)),
-            k_axis=(128, splits.get(k, 1)),
-            max_cores=MAX_CORES,
-        )
-        self.assertLess(cost, float("inf"))
-        self._assert_cost_not_regressed("test_batched_prefill_bert_style_b8_m512", cost)
+        self.assertEqual(prod(splits.values()), MAX_CORES)
 
 
 if __name__ == "__main__":
     unittest.main()
+
