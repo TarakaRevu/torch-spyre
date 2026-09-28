@@ -810,4 +810,3 @@ class TestBatchedPrefillCostModelBgt1Mgt1(_CostModelAssertMixin, unittest.TestCa
 
 if __name__ == "__main__":
     unittest.main()
-
