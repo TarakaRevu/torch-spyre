@@ -1337,6 +1337,42 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertEqual(math.prod(splits.values()), 32)
         self.assertGreater(splits[k], 1)
 
+    def test_m1_matmul_default_on_all_cores_is_kept(self):
+        """#4032: an M=1 matmul whose default split already uses all 32 cores
+        keeps it -- the multicast penalty overprices N splits for M=1, so
+        repricing it moved 14336x4096 to n=8, k=4 and made it slower."""
+        n, k = (_isym(name) for name in ("n", "k"))
+        op = _computed_buffer(
+            (4096,),
+            name="mm_out",
+            reduction_type="batchmatmul",
+            reduction_ranges=(14336,),
+        )
+        output_td = _tensor_dep("mm_out", (4096,), (n,))
+        input_tds = [
+            _tensor_dep("lhs", (14336,), (k,)),
+            _tensor_dep("rhs", (14336, 4096), (k, n)),
+        ]
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            {n: 4096, k: 14336}, input_tds + [output_td]
+        )
+        default = {n: 32, k: 1}
+
+        splits = _cost_model_matmul_planner(
+            op,
+            default,
+            it_space_adjusted,
+            output_td,
+            stick_vars,
+            {},
+            32,
+            input_tds,
+            set(),
+            {},
+        )
+
+        self.assertEqual(splits, default)
+
     def test_fp8_cost_model_uses_correct_elems_per_stick(self):
         """#4466: N_e/K_e must come from the FP8 operand's stick (128
         elems/stick), not the FP16 output's (64) -- else they're halved."""

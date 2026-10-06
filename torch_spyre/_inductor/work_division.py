@@ -1836,9 +1836,14 @@ def _cost_model_matmul_planner(
     m_dim: Symbol | None
     if not row_dims:
         # M=1 (#4032): the size-1 M dim is dropped from the iteration space,
-        # leaving only N and K. Price it as M=1 with nothing to split instead of
-        # deferring to the default distributor, which splits N alone and can
-        # leave cores idle (N=25600 -> 25 of 32 cores, K never split).
+        # leaving only N and K. The default distributor splits N alone, which
+        # can leave cores idle (N=25600 -> 25 of 32 cores, K never split); price
+        # it as M=1 with nothing to split in that case. When the default already
+        # uses every core keep it: the multicast penalty in
+        # _matmul_execution_cost scales weight bytes by the N-split cohort, so
+        # it overprices large N splits for M=1 and would always pick K splits.
+        if math.prod(splits.values()) >= max_cores:
+            return splits
         m_dim = None
     else:
         m_candidates = _single_input_row_dims(row_dims, input_tds)
