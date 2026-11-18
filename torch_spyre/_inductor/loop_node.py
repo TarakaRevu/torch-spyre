@@ -129,14 +129,14 @@ class LoopNode(ir.Operation):
         return self.origins
 
     def mutation_targets(self) -> list[str]:
-        """Names of the buffers the body's ``MutationLayoutSHOULDREMOVE`` ops write."""
-        from .deadcode_elimination import _mutation_target
+        """Names of the buffers the body's mutations write in place."""
+        from .deadcode_elimination import _leaf_mutation_targets
 
         targets: list[str] = []
         for op in all_ops(self.body):
-            target = _mutation_target(op)
-            if target is not None and target not in targets:
-                targets.append(target)
+            for target in _leaf_mutation_targets(op):
+                if target not in targets:
+                    targets.append(target)
         return targets
 
     def get_read_writes(self) -> dependencies.ReadWrites:

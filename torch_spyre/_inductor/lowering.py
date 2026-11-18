@@ -181,6 +181,46 @@ def register_fallback_over_decomp(fallback_ops):
 # so only clamp_min and clamp_max reach lowering.
 
 
+@contextmanager
+def _deterministic_algorithms_disabled():
+    """Turn ``torch.use_deterministic_algorithms`` off for the enclosed code.
+
+    Restores the caller's setting, including ``warn_only``, on exit.
+    """
+    if not torch.are_deterministic_algorithms_enabled():
+        yield
+        return
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+
+
+def _spyre_index_put_impl_(stock):
+    """Keep an overwrite ``index_put`` of a Spyre tensor on the device path.
+
+    Under ``torch.use_deterministic_algorithms(True)`` upstream lowers every
+    ``index_put`` (and the ops decomposed into it: ``index_copy``,
+    ``index_add``, ``index_fill``, ``x[idx] = v``) to ``IndexPutFallback``,
+    which calls the eager aten kernel. Spyre has no such kernel
+    (``_index_put_impl_``), so the write could never run (issue #4436). The
+    device lowering of an overwrite has no atomics and a fixed compiled
+    schedule, so it is deterministic and is used instead. ``accumulate=True``
+    and non-Spyre tensors keep the stock behavior.
+    """
+
+    def impl(self, indices, values, accumulate, check, may_realize=False):
+        device = self.get_device() if hasattr(self, "get_device") else None
+        if accumulate or device is None or device.type != DEVICE_NAME:
+            return stock(self, indices, values, accumulate, check, may_realize)
+        with _deterministic_algorithms_disabled():
+            return stock(self, indices, values, accumulate, check, may_realize)
+
+    return impl
+
+
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
 @contextmanager
 def enable_spyre_lowerings():
@@ -241,6 +281,11 @@ def enable_spyre_lowerings():
             if clamp_max_ov is not None:
                 lowering.lowerings[clamp_max_ov] = _spyre_clamp_max
 
+            # Deterministic mode would send index_put of a Spyre tensor to an
+            # eager fallback Spyre cannot run; see _spyre_index_put_impl_.
+            enable_spyre_lowerings._stock_index_put_impl = lowering.index_put_impl_
+            lowering.index_put_impl_ = _spyre_index_put_impl_(lowering.index_put_impl_)
+
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
             enable_spyre_lowerings._saved_lowerings = saved_intree_lowerings
@@ -258,6 +303,7 @@ def enable_spyre_lowerings():
                         lowering.lowerings.pop(ov, None)
                     else:
                         lowering.lowerings[ov] = prev
+                lowering.index_put_impl_ = enable_spyre_lowerings._stock_index_put_impl
                 # Clean up
                 enable_spyre_lowerings._saved_aten_lowerings = {}
                 # Reset the saved in-tree lowerings if needed

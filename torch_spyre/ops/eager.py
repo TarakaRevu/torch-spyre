@@ -680,6 +680,60 @@ def spyre__cumsum_(
     return self
 
 
+def _register_index_put_kernels():
+    """Eager ``index_put`` / ``index_put_`` / ``x[idx] = v`` on Spyre.
+
+    The compiled path already lowers an overwrite ``index_put`` with integer
+    indices to Spyre's indirect store, so the eager kernel is that op compiled
+    on its own, like every op in ``COMPILED_OPS``. It is registered here
+    rather than in that list to keep two cases rejected exactly as before,
+    since the device path would get them wrong:
+
+    - ``accumulate=True``: the indirect store overwrites instead of adding.
+    - Boolean / uint8 mask indices: Inductor lowers them through
+      ``masked_fill``, which does not place values correctly on Spyre.
+
+    The in-place forms (``index_put_``, and ``_index_put_impl_``, which
+    ``x[idx] = v`` dispatches to) compute the functional result and
+    ``copy_`` it back, as ``_make_inplace_kernel`` does for the other ops.
+    """
+    functional = aten.index_put.default
+    compiled = compile_once(functional, dynamic=False)(
+        _make_offset_safe_dispatch(functional)
+    )
+
+    def _reject(indices, accumulate):
+        if accumulate:
+            return "accumulate=True"
+        for index in indices:
+            if index is not None and index.dtype in (torch.bool, torch.uint8):
+                return "boolean mask indices"
+        return None
+
+    def index_put(self, indices, values, accumulate=False):
+        reason = _reject(indices, accumulate)
+        if reason is not None:
+            raise NotImplementedError(
+                f"index_put with {reason} is not supported on the Spyre backend"
+            )
+        return compiled(self, indices, values, accumulate)
+
+    inplace = _make_inplace_kernel(functional)
+
+    def index_put_impl_(self, indices, values, accumulate=False, unsafe=False):
+        # unsafe only skips index bounds checks; the device path does not use it.
+        return inplace(self, indices, values, accumulate)
+
+    torch.library.register_kernel(functional.name(), ["spyre"])(index_put)
+    torch.library.register_kernel(aten.index_put_.default.name(), ["spyre"])(inplace)
+    torch.library.register_kernel(aten._index_put_impl_.default.name(), ["spyre"])(
+        index_put_impl_
+    )
+
+
+_register_index_put_kernels()
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex

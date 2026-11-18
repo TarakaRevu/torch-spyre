@@ -14,6 +14,7 @@
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    ExternKernel,
     FallbackKernel,
     MutationLayoutSHOULDREMOVE,
     Operation,
@@ -81,58 +82,73 @@ def _walk_once(
             live_bufs.add(target)
 
 
-def _mutation_target(op: Operation) -> str | None:
-    """The buffer ``op`` writes into in place, else None.
+def _leaf_mutation_targets(op: Operation) -> list[str]:
+    """The buffers a leaf op writes in place, else [].
 
-    That is a ``MutationLayoutSHOULDREMOVE`` op's target, or the declared
-    storage of a loop-carry update still in its pure form: between the splice
-    and ``loop_carries.apply_loop_carries`` the update writes its own buffer,
-    but its ``LoopCarryRecord`` says it will write the storage, and its value
+    That is a ``MutationLayoutSHOULDREMOVE`` op's target; the declared storage
+    of a loop-carry update still in its pure form; or the inputs an in-place
+    ``ExternKernel`` declares through ``get_mutation_names``.
+
+    A loop-carry update: between the splice and
+    ``loop_carries.apply_loop_carries`` the update writes its own buffer, but
+    its ``LoopCarryRecord`` says it will write the storage, and its value
     reaches the next trip only through that write. Judging it as the mutation
     it is about to become keeps a carry whose result nobody reads after the
     loop, exactly as when the splice made the write in place itself.
+
+    An in-place ``ExternKernel``: e.g. ``ScatterFallback`` /
+    ``IndexPutFallback``, which Inductor lowers ``scatter_`` / ``index_put_``
+    to under ``torch.use_deterministic_algorithms(True)``. Such a kernel has a
+    ``NoneLayout``: its only write is its own unused name, so without this it
+    reads as dead and the write disappears (issue #4436).
+
+    A ``FallbackKernel`` is left out: whether it must stay is
+    ``FallbackKernel.has_side_effects``'s call, as before.
     """
-    if not isinstance(op, ComputedBuffer):
-        return None
-    if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-        return op.layout.get_buffer().get_name()
-    record = getattr(op, "_loop_carry_record", None)
-    if isinstance(record, LoopCarryRecord) and record.update_name == op.get_name():
-        return record.storage_name
-    return None
+    if isinstance(op, ComputedBuffer):
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            return [op.layout.get_buffer().get_name()]
+        record = getattr(op, "_loop_carry_record", None)
+        if isinstance(record, LoopCarryRecord) and record.update_name == op.get_name():
+            return [record.storage_name]
+        return []
+    if isinstance(op, ExternKernel) and not isinstance(op, FallbackKernel):
+        return list(dict.fromkeys(op.get_mutation_names()))
+    return []
 
 
 def _mutation_targets(op: Operation) -> list[str]:
-    """Every buffer ``op`` writes in place: its own target, or for a
+    """Every buffer ``op`` writes in place: its own targets, or for a
     ``LoopNode`` the targets of its body's mutations."""
     if isinstance(op, LoopNode):
         return op.mutation_targets()
-    target = _mutation_target(op)
-    return [] if target is None else [target]
+    return _leaf_mutation_targets(op)
 
 
 def _mutation_target_is_live(op: Operation, live_bufs: set[str]) -> bool:
     """Whether a side-effecting op's write can still be observed.
 
-    Only a ``MutationLayoutSHOULDREMOVE`` names a target, so anything else
-    side-effecting (an impure ``FallbackKernel``) is assumed observable.  A
-    ``LoopNode`` is observable when any side-effecting op of its body is:
-    one whose mutation target is live, or an impure fallback.
+    A mutation is observable when one of its targets is live. Anything else
+    side-effecting (an impure ``FallbackKernel``) names no target and is
+    assumed observable.  A ``LoopNode`` is observable when any side-effecting
+    op of its body is: one whose mutation target is live, or an impure
+    fallback.
     """
     if isinstance(op, LoopNode):
         return any(
             _has_side_effects(leaf) and _mutation_target_is_live(leaf, live_bufs)
             for leaf in all_ops(op.body)
         )
-    target = _mutation_target(op)
-    return target is None or target in live_bufs
+    targets = _leaf_mutation_targets(op)
+    return not targets or any(target in live_bufs for target in targets)
 
 
 def _has_side_effects(op: Operation) -> bool:
     """Return True if op must not be eliminated regardless of whether its
     outputs are used.
 
-    A mutation writes into a buffer it does not own, so it has side effects;
+    A mutation -- a ``MutationLayoutSHOULDREMOVE`` op or an in-place
+    ``ExternKernel`` -- writes into a buffer it does not own, so it has side effects;
     whether that write can still be observed is ``_mutation_target_is_live``'s
     call.  FallbackKernel delegates to is_impure on the underlying op overload.
     A ``LoopNode`` has side effects when any op of its body has.  All other op
@@ -140,7 +156,7 @@ def _has_side_effects(op: Operation) -> bool:
     """
     if isinstance(op, LoopNode):
         return op.has_side_effects()
-    if _mutation_target(op) is not None:
+    if _leaf_mutation_targets(op):
         return True
     if isinstance(op, FallbackKernel):
         return op.has_side_effects()

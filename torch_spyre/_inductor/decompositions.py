@@ -4162,6 +4162,267 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
+# ``scatter(dim, index, value)`` with a Python scalar ``value``. Inductor lowers
+# it to an indirect store of a constant, which Spyre codegen cannot emit, or --
+# under ``torch.use_deterministic_algorithms(True)`` -- to ``ScatterFallback``,
+# which has no Spyre kernel. It is rewritten here as dense compare-and-select
+# work that only uses ops Spyre lowers directly. A scalar is the same for every
+# write, so duplicate indices cannot make the result depend on write order.
+
+_SCATTER_CHUNK = 64
+
+# Largest id that compares exactly in each dtype on device (fp16 runs as DL16,
+# which has fewer mantissa bits than IEEE fp16).
+_SCATTER_MAX_EXACT_ID = {
+    torch.float32: 1 << 24,
+    torch.float16: 1024,
+    torch.bfloat16: 256,
+}
+
+
+def _scatter_lanes_to_column(row: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Turn fp32 ``[..., L]`` (L a multiple of 64) into ``[..., L, 1]`` of ``dtype``.
+
+    A row cannot be re-laid as a column directly (that moves data off the stick
+    dim), so each 64-wide chunk is masked with an identity built from an fp32
+    iota and summed over the stick dim, which leaves a size-1 stick.
+    """
+    *lead, width = row.shape
+    chunk = _SCATTER_CHUNK
+    flat = torch.arange(chunk * chunk, device=row.device, dtype=torch.float32)
+    row_id = torch.floor((flat.reshape(1, chunk, chunk) + 0.5) / chunk)
+    lane_id = torch.arange(chunk, device=row.device, dtype=torch.float32)
+    eye = row_id == lane_id.reshape(1, 1, chunk)
+    chunks = row.reshape(*lead, width // chunk, 1, chunk)
+    col = torch.where(eye, chunks, 0.0).sum(-1, keepdim=True)
+    if dtype != torch.float32:
+        col = col.to(dtype)
+    return col.reshape(*lead, width, 1)
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter.value])
+def spyre_scatter_value(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[bool, float, int],
+) -> torch.Tensor:
+    """``scatter`` of a scalar as dense compare-and-select work.
+
+    With ``N = self.size(dim)`` and the K picks of ``index`` along ``dim``::
+
+        hit[..., n, ...] = sum_k (index[..., k, ...] == n)
+        out              = where(hit > 0, value, self)
+
+    The work runs with ``dim`` on the stick: another ``dim`` is moved there
+    and back. The K lanes of ``index`` are turned into a column (see
+    :func:`_scatter_lanes_to_column`, padded to whole sticks with an id that
+    matches nothing), so K is reduced off the stick and N stays on it, and
+    every dtype cast is of a size-1-stick column.
+
+    ``index`` must match ``self`` in every dim but ``dim``. Out-of-range
+    indices match nothing and are dropped instead of raising. Work and memory
+    scale with ``index.numel() * N``.
+    """
+    dtype = self.dtype
+    if dtype not in _SCATTER_MAX_EXACT_ID:
+        raise Unsupported(
+            f"scatter of a scalar on {dtype}: only float16, bfloat16 and float32"
+        )
+    if self.dim() == 0:
+        self_nd = self.reshape(1)
+        index = index.reshape(1)
+        return spyre_scatter_value(self_nd, 0, index, value).reshape(())
+    ndim = self.dim()
+    dim = dim % ndim
+    if index.dim() != ndim:
+        raise RuntimeError(
+            "scatter(): Index tensor must have the same number of dimensions "
+            "as self tensor"
+        )
+    # Every size is specialized (guarded), so under dynamic=True this op
+    # recompiles per shape. N and K become stick dims below, which must be
+    # static on Spyre, and casting a column whose leading dims are symbolic
+    # faults the device at runtime.
+    for size in (*self.shape, *index.shape):
+        int(size)
+    if index.numel() == 0:
+        return self.clone()
+    for d in range(ndim):
+        if d != dim and index.shape[d] != self.shape[d]:
+            raise Unsupported(
+                f"scatter of a scalar with index shape {list(index.shape)} and "
+                f"self shape {list(self.shape)}: Spyre needs them to match "
+                f"outside dim {dim}"
+            )
+    n = int(self.shape[dim])
+    if n > _SCATTER_MAX_EXACT_ID[dtype]:
+        raise Unsupported(
+            f"scatter of a scalar into dim {dim} of size {n} on {dtype}: ids must "
+            f"stay <= {_SCATTER_MAX_EXACT_ID[dtype]} to compare exactly on device"
+        )
+
+    # A leading size-1 dim keeps a 1-D tensor's only dim from being both the
+    # stick and the dim that is padded below.
+    if ndim == 1:
+        out = spyre_scatter_value(self.reshape(1, n), 1, index.reshape(1, -1), value)
+        return out.reshape(n)
+
+    if dim != ndim - 1:
+        # Comparing in place would cast the full-stick index to ``dtype``,
+        # which staggers it against ``self``. Move ``dim`` onto the stick
+        # instead, where every cast is of a size-1-stick column.
+        out = spyre_scatter_value(
+            self.movedim(dim, -1), ndim - 1, index.movedim(dim, -1), value
+        )
+        return out.movedim(-1, dim).contiguous()
+
+    # dim is the stick dim from here on. Pad K to whole sticks with an id that
+    # matches nothing, then turn the K lanes into a column so that K is
+    # reduced off the stick and N stays on it.
+    k = int(index.shape[-1])
+    width = -(-k // _SCATTER_CHUNK) * _SCATTER_CHUNK
+    idx = torch.nn.functional.pad(index.to(torch.float32), (0, width - k), value=-1.0)
+    idx = _scatter_lanes_to_column(idx, dtype)  # [..., Kp, 1]
+    ids = torch.arange(n, device=self.device, dtype=dtype)
+    hit = (idx == ids).to(dtype).sum(-2)  # [..., N]
+    return torch.where(hit > 0.5, torch.full_like(self, value), self)
+
+
+def _scatter_values_to_column(row: torch.Tensor) -> torch.Tensor:
+    """Turn ``[..., L]`` values (L a multiple of 64) into a ``[..., L, 1]``
+    column of the same dtype.
+
+    fp32 goes through :func:`_scatter_lanes_to_column` directly. A 16-bit row
+    cannot be cast to fp32 first (writing the converted, padded row is not
+    stick aligned), so its identity mask is built in its own dtype, from a
+    0..63 lane column that is exact in every float dtype.
+    """
+    if row.dtype == torch.float32:
+        return _scatter_lanes_to_column(row, torch.float32)
+    *lead, width = row.shape
+    chunk = _SCATTER_CHUNK
+    lanes = torch.arange(chunk, device=row.device, dtype=torch.float32)
+    lane_col = _scatter_lanes_to_column(lanes.reshape(1, chunk), row.dtype)
+    lane_row = torch.arange(chunk, device=row.device, dtype=row.dtype)
+    eye = lane_col.reshape(1, chunk, 1) == lane_row.reshape(1, 1, chunk)
+    chunks = row.reshape(*lead, width // chunk, 1, chunk)
+    col = torch.where(eye, chunks, 0.0).sum(-1, keepdim=True)
+    return col.reshape(*lead, width, 1)
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter.src])
+def spyre_scatter_src(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    src: torch.Tensor,
+) -> torch.Tensor:
+    """``scatter`` of a tensor ``src`` as dense compare-and-select work.
+
+    The same shape as :func:`spyre_scatter_value`, plus a choice of value: of
+    the K picks that hit a slot, the last one (largest k) wins, which is the
+    order CPU writes in, so repeated indices match CPU too::
+
+        hit[k, n]  = index[k] == n
+        last[n]    = max_k (k + 1 if hit[k, n] else 0)
+        out[n]     = src[last[n] - 1] if last[n] > 0 else self[n]
+
+    The value is chosen with ``where``, not by multiplying with the hit mask,
+    so an inf or nan in ``src`` only reaches the slots it is written to.
+    ``src`` may be larger than ``index``; only its first ``index.shape``
+    entries are used, as in PyTorch.
+    """
+    dtype = self.dtype
+    if dtype not in _SCATTER_MAX_EXACT_ID:
+        raise Unsupported(
+            f"scatter of a tensor on {dtype}: only float16, bfloat16 and float32"
+        )
+    if self.dim() == 0:
+        out = spyre_scatter_src(self.reshape(1), 0, index.reshape(1), src.reshape(1))
+        return out.reshape(())
+    ndim = self.dim()
+    dim = dim % ndim
+    if index.dim() != ndim or src.dim() != ndim:
+        raise RuntimeError(
+            "scatter(): Index tensor must have the same number of dimensions "
+            "as self and src tensors"
+        )
+    for size in (*self.shape, *index.shape, *src.shape):
+        int(size)  # specialize, see spyre_scatter_value
+    if index.numel() == 0:
+        return self.clone()
+    for d in range(ndim):
+        if d != dim and index.shape[d] != self.shape[d]:
+            raise Unsupported(
+                f"scatter with index shape {list(index.shape)} and self shape "
+                f"{list(self.shape)}: Spyre needs them to match outside dim {dim}"
+            )
+    if list(src.shape) != list(index.shape):
+        src = src[tuple(slice(0, int(s)) for s in index.shape)]
+    src = src.to(dtype)
+    n = int(self.shape[dim])
+    k = int(index.shape[dim])
+    limit = _SCATTER_MAX_EXACT_ID[dtype]
+    if n > limit or k > limit:
+        raise Unsupported(
+            f"scatter of a tensor into dim {dim} of size {n} with {k} picks on "
+            f"{dtype}: ids must stay <= {limit} to compare exactly on device"
+        )
+    if ndim == 1:
+        out = spyre_scatter_src(
+            self.reshape(1, n), 1, index.reshape(1, -1), src.reshape(1, -1)
+        )
+        return out.reshape(n)
+    if dim != ndim - 1:
+        out = spyre_scatter_src(
+            self.movedim(dim, -1),
+            ndim - 1,
+            index.movedim(dim, -1),
+            src.movedim(dim, -1),
+        )
+        return out.movedim(-1, dim).contiguous()
+
+    width = -(-k // _SCATTER_CHUNK) * _SCATTER_CHUNK
+    pad = (0, width - k)
+    idx = torch.nn.functional.pad(index.to(torch.float32), pad, value=-1.0)
+    idx = _scatter_lanes_to_column(idx, dtype)  # [..., Kp, 1]
+    val = _scatter_values_to_column(
+        torch.nn.functional.pad(src, pad, value=0.0)
+    )  # [..., Kp, 1]
+    order = torch.arange(1, width + 1, device=self.device, dtype=torch.float32)
+    order = _scatter_lanes_to_column(order.reshape(1, width), dtype)  # [1, Kp, 1]
+    ids = torch.arange(n, device=self.device, dtype=dtype)
+    hit = idx == ids  # [..., Kp, N]
+    rank = torch.where(hit, order, 0.0)
+    last = rank.amax(-2, keepdim=True)  # [..., 1, N]
+    win = hit & (rank == last)
+    picked = torch.where(win, val, 0.0).sum(-2)  # [..., N]
+    return torch.where(last.squeeze(-2) > 0.5, picked, self)
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter_.src])
+def spyre_scatter_src_(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    src: torch.Tensor,
+) -> torch.Tensor:
+    """In-place ``scatter_`` of a tensor: compute it and copy it back."""
+    return self.copy_(spyre_scatter_src(self, dim, index, src))
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter_.value])
+def spyre_scatter_value_(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[bool, float, int],
+) -> torch.Tensor:
+    """In-place ``scatter_`` of a scalar: compute it and copy it back."""
+    return self.copy_(spyre_scatter_value(self, dim, index, value))
+
+
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
     """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
 
